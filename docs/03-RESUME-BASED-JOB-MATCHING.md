@@ -45,10 +45,14 @@ Every job must first pass three gates:
 2. It contains a backend or applied-AI signal.
 3. Its minimum experience requirement is no more than four years.
 
-Passing jobs receive points for title similarity, required skills, preferred
-resume skills, and experience fit. A score of 60 or more is eligible. The bot
-also limits each role family to two successful applications per run so one type
-of job cannot consume the whole run.
+Search cards do not make the final decision. They prioritize a limited set of
+likely candidates, after which the bot opens each selected Shine page and reads
+the complete job description, detail-page skills, and experience requirement.
+
+Passing detailed jobs receive points for title similarity, required skills,
+preferred resume skills, and experience fit. A score of 60 or more is eligible.
+The bot also limits each role family to two successful applications per run so
+one type of job cannot consume the whole run.
 
 ## Change matching lists
 

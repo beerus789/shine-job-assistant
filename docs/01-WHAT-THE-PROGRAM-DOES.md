@@ -4,11 +4,13 @@ Think of the program as a careful job-search assistant. It follows this order:
 
 1. Signs in to Shine using the information stored in `.env`.
 2. Searches using Python-backend and GenAI-specific phrases.
-3. Reads each job's title, skills, and experience requirement.
-4. Rejects jobs that do not match the resume.
-5. Ranks suitable jobs and applies within the configured limits.
-6. Selects known salary, experience, and notice-period dropdown cards when asked.
-7. Sends slow, redirected, or unfamiliar forms to the manual-review queue.
+3. Uses search cards only to prioritize likely candidates.
+4. Opens selected Shine job pages and reads their full description, skills, and
+   experience requirement.
+5. Calculates the final score only from the detailed job data.
+6. Ranks suitable jobs and applies within the configured limits.
+7. Selects known salary, experience, and notice-period dropdown cards when asked.
+8. Sends slow, redirected, or unfamiliar forms to the manual-review queue.
 
 ## How an application is verified
 

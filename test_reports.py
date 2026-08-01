@@ -1,6 +1,7 @@
 import json
 
 import bot
+from scoring import score_job
 
 
 def test_card_option_matching_uses_value_not_position():
@@ -21,6 +22,48 @@ def test_only_https_shine_urls_are_allowed():
     assert not bot._is_shine_url("http://www.shine.com/jobs/example/123")
     assert not bot._is_shine_url("https://shine.com.example.org/jobs/123")
     assert not bot._is_shine_url("https://external-employer.example/apply")
+
+
+def test_full_job_details_replace_misleading_card_content():
+    card_job = bot.Job(
+        title="Backend Engineer",
+        company="Example",
+        url="https://www.shine.com/jobs/backend/example/123",
+        text="Python FastAPI card keywords",
+        skills=("Python", "FastAPI"),
+        min_experience=2,
+        max_experience=5,
+    )
+    detailed = bot.merge_job_details(
+        card_job,
+        description="Build Java and Spring services.",
+        detail_skills=["Java", "Spring"],
+        highlights="3 to 6 Yrs",
+    )
+
+    assert "card keywords" not in detailed.text
+    assert detailed.skills == ("Java", "Spring")
+    assert (detailed.min_experience, detailed.max_experience) == (3, 6)
+    assert not score_job(detailed).accepted
+
+
+def test_full_job_details_can_rescue_an_incomplete_card():
+    card_job = bot.Job(
+        title="Backend Engineer",
+        company="Example",
+        url="https://www.shine.com/jobs/backend/example/456",
+        text="Short card without technologies",
+        min_experience=2,
+        max_experience=4,
+    )
+    detailed = bot.merge_job_details(
+        card_job,
+        description="Build Python FastAPI backend microservices.",
+        detail_skills=["Python", "FastAPI", "PostgreSQL", "Docker", "Redis"],
+        highlights="2 to 4 Yrs",
+    )
+
+    assert score_job(detailed).accepted
 
 
 def test_json_reports_separate_scored_and_manual_jobs(tmp_path, monkeypatch):

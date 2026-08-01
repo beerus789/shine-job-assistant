@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from playwright.async_api import BrowserContext, Locator, Page, async_playwright
 
 import config
-from scoring import Job, parse_experience, score_job
+from scoring import Job, ScoreResult, parse_experience, preliminary_job_priority, score_job
 
 BASE_URL = "https://www.shine.com"
 ROOT = Path(__file__).resolve().parent
@@ -194,6 +194,131 @@ async def discover(page: Page, max_pages: int, navigation_timeout_ms: int) -> li
             for job in await extract_jobs(page):
                 discovered[job.url] = job
     return list(discovered.values())
+
+
+def merge_job_details(
+    job: Job,
+    description: str,
+    detail_skills: list[str],
+    highlights: str,
+) -> Job:
+    """Replace incomplete card fields with content from the actual job page."""
+    minimum, maximum = parse_experience(highlights)
+    unique_skills = tuple(dict.fromkeys(skill.strip() for skill in detail_skills if skill.strip()))
+    return Job(
+        title=job.title,
+        company=job.company,
+        url=job.url,
+        text="\n".join(part for part in (description.strip(), highlights.strip()) if part),
+        skills=unique_skills,
+        min_experience=minimum if minimum is not None else job.min_experience,
+        max_experience=maximum if maximum is not None else job.max_experience,
+    )
+
+
+async def extract_job_detail(
+    page: Page, job: Job, navigation_timeout_ms: int
+) -> Job:
+    """Load one Shine job page and extract its description, skills, and experience."""
+    await page.goto(job.url, wait_until="domcontentloaded", timeout=navigation_timeout_ms)
+    if not _is_shine_url(page.url):
+        raise ManualReviewRequired(
+            f"Job detail redirected outside Shine ({page.url}); the external page was not used"
+        )
+    if not _same_job_path(job.url, page.url):
+        raise ManualReviewRequired(f"Job detail redirected to {page.url}")
+
+    description_heading = page.get_by_role("heading", name="Job Description", exact=True)
+    await description_heading.wait_for(state="visible", timeout=navigation_timeout_ms)
+    if await description_heading.count() != 1:
+        raise RuntimeError("Expected one Job Description heading")
+    description_scope = description_heading.locator("xpath=following-sibling::*[1]")
+    if await description_scope.count() != 1:
+        raise RuntimeError("Job Description content was not found")
+    description = (await description_scope.inner_text()).strip()
+    if not description:
+        raise RuntimeError("Job Description is empty")
+
+    highlights = ""
+    highlights_heading = page.get_by_role("heading", name="Key Highlights", exact=True)
+    if await highlights_heading.count() == 1:
+        highlights_scope = highlights_heading.locator("xpath=following-sibling::*[1]")
+        if await highlights_scope.count() == 1:
+            highlights = (await highlights_scope.inner_text()).strip()
+
+    detail_skills: list[str] = []
+    skills_label = page.get_by_text("SKILLS", exact=True)
+    if await skills_label.count() == 1:
+        skills_scope = skills_label.locator("xpath=following-sibling::*[1]")
+        if await skills_scope.count() == 1:
+            detail_skills = await skills_scope.locator("a, li").all_inner_texts()
+            if not detail_skills:
+                detail_skills = (await skills_scope.inner_text()).splitlines()
+
+    return merge_job_details(job, description, detail_skills, highlights)
+
+
+def select_detail_candidates(
+    jobs: list[Job], maximum: int
+) -> tuple[list[Job], dict[str, str]]:
+    """Select the strongest safe card candidates for mandatory detail scoring."""
+    ranked_candidates: list[tuple[int, Job]] = []
+    skipped: dict[str, str] = {}
+    for job in jobs:
+        priority = preliminary_job_priority(job)
+        if priority is None:
+            skipped[job.url] = "rejected by title or experience before detail scoring"
+        else:
+            ranked_candidates.append((priority, job))
+
+    ranked_candidates.sort(key=lambda pair: pair[0], reverse=True)
+    selected = [job for _, job in ranked_candidates[:maximum]]
+    for _, job in ranked_candidates[maximum:]:
+        skipped[job.url] = f"detail-scoring limit reached ({maximum} jobs)"
+    return selected, skipped
+
+
+async def score_detailed_jobs(
+    page: Page,
+    jobs: list[Job],
+    maximum: int,
+    navigation_timeout_ms: int,
+    detail_timeout_seconds: int,
+) -> tuple[list[tuple[ScoreResult, Job]], dict[str, str]]:
+    """Score only enriched jobs and surface detail failures for manual review."""
+    selected, skipped = select_detail_candidates(jobs, maximum)
+    enriched: dict[str, Job] = {}
+    failures: dict[str, str] = {}
+
+    for job in selected:
+        try:
+            enriched[job.url] = await asyncio.wait_for(
+                extract_job_detail(page, job, navigation_timeout_ms),
+                timeout=detail_timeout_seconds,
+            )
+        except TimeoutError:
+            failures[job.url] = (
+                f"job-detail extraction exceeded {detail_timeout_seconds} seconds"
+            )
+        except Exception as exc:
+            failures[job.url] = f"job-detail extraction failed: {str(exc).strip() or type(exc).__name__}"
+
+    scored: list[tuple[ScoreResult, Job]] = []
+    statuses: dict[str, str] = {}
+    for job in jobs:
+        if job.url in enriched:
+            detailed_job = enriched[job.url]
+            scored.append((score_job(detailed_job), detailed_job))
+        elif job.url in failures:
+            reason = failures[job.url]
+            scored.append((ScoreResult(0, False, (reason,)), job))
+            statuses[job.url] = f"needs_review: {reason}"
+        else:
+            reason = skipped.get(job.url, "not selected for detail scoring")
+            scored.append((ScoreResult(0, False, (reason,)), job))
+
+    scored.sort(key=lambda pair: pair[0].score, reverse=True)
+    return scored, statuses
 
 
 def role_family(job: Job) -> str:
@@ -774,6 +899,8 @@ async def run() -> None:
     authentication_timeout_ms = env_int("AUTH_TIMEOUT_SECONDS", 15) * 1_000
     apply_timeout_ms = env_int("APPLY_TIMEOUT_SECONDS", 15) * 1_000
     per_job_timeout_seconds = env_int("PER_JOB_TIMEOUT_SECONDS", 45)
+    detail_timeout_seconds = env_int("DETAIL_TIMEOUT_SECONDS", 20)
+    max_detail_jobs = env_int("MAX_DETAIL_JOBS_PER_RUN", 40)
     answers = ApplicationAnswers.from_environment()
 
     if not dry_run and (not email or not password):
@@ -796,11 +923,17 @@ async def run() -> None:
             if not dry_run:
                 await login(page, email, password, navigation_timeout_ms)
             jobs = await discover(page, max_pages, navigation_timeout_ms)
-            ranked = sorted(((score_job(job), job) for job in jobs), key=lambda pair: pair[0].score, reverse=True)
+            ranked, detail_statuses = await score_detailed_jobs(
+                page,
+                jobs,
+                max_detail_jobs,
+                navigation_timeout_ms,
+                detail_timeout_seconds,
+            )
 
             applied_this_run = 0
             for result, job in ranked:
-                status = "rejected"
+                status = detail_statuses.get(job.url, "rejected")
                 if result.accepted:
                     family = role_family(job)
                     if job.url in history:

@@ -1,5 +1,11 @@
 import config
-from scoring import Job, contains_phrase, parse_experience, score_job
+from scoring import (
+    Job,
+    contains_phrase,
+    parse_experience,
+    preliminary_job_priority,
+    score_job,
+)
 
 
 def test_human_editable_settings_are_loaded():
@@ -29,6 +35,16 @@ def make_job(**overrides):
     }
     values.update(overrides)
     return Job(**values)
+
+
+def test_preliminary_filter_keeps_incomplete_backend_card():
+    job = make_job(title="Backend Engineer", text="", skills=())
+    assert preliminary_job_priority(job) is not None
+
+
+def test_preliminary_filter_rejects_blocked_title_and_excess_experience():
+    assert preliminary_job_priority(make_job(title="Python Technical Support")) is None
+    assert preliminary_job_priority(make_job(min_experience=7, max_experience=10)) is None
 
 
 def test_strong_match_is_accepted():

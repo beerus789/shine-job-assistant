@@ -10,10 +10,12 @@ settings can be adjusted using plain numbers or `true` / `false`.
 | `MAX_APPLICATIONS_PER_RUN` | `3` | At most three successful applications per launch. |
 | `MAX_APPLICATIONS_PER_DAY` | `10` | Hard daily limit across all launches. |
 | `MAX_PAGES_PER_SEARCH` | `1` | Checks the first page of each precise search. |
+| `MAX_DETAIL_JOBS_PER_RUN` | `40` | Maximum candidate pages loaded for final scoring. |
 | `ACTION_DELAY_SECONDS` | `5` | Pause after a verified application. |
 | `NAVIGATION_TIMEOUT_SECONDS` | `30` | Maximum wait for page navigation. |
 | `AUTH_TIMEOUT_SECONDS` | `15` | Maximum wait for the signed-in job page. |
 | `APPLY_TIMEOUT_SECONDS` | `15` | Maximum wait for the Applied confirmation. |
+| `DETAIL_TIMEOUT_SECONDS` | `20` | Maximum time for one detail-page extraction. |
 | `PER_JOB_TIMEOUT_SECONDS` | `45` | Hard limit for one complete job attempt. |
 | `CANDIDATE_EXPERIENCE_YEARS` | blank | Your years of experience. |
 | `CANDIDATE_EXPERIENCE_MONTHS` | blank | Your extra months of experience. |

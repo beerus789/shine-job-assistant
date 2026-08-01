@@ -64,6 +64,27 @@ def _title_similarity(title: str) -> float:
     )
 
 
+def preliminary_job_priority(job: Job) -> int | None:
+    """Rank safe detail-page candidates without making a final decision.
+
+    Search cards are incomplete, so missing skills never reject a job here.
+    Only an unsuitable title or an excessive minimum-experience requirement is
+    considered strong enough to avoid the extra detail-page request.
+    """
+    if any(contains_phrase(job.title, keyword) for keyword in config.BLOCKED_KEYWORDS):
+        return None
+    if job.min_experience is not None and job.min_experience > config.MAX_REQUIRED_EXPERIENCE:
+        return None
+
+    priority = round(_title_similarity(job.title) * 100)
+    priority += 10 * sum(
+        contains_phrase(job.searchable_text, skill) for skill in config.REQUIRED_SKILLS
+    )
+    if any(contains_phrase(job.searchable_text, signal) for signal in config.ROLE_SIGNALS):
+        priority += 5
+    return priority
+
+
 def score_job(job: Job) -> ScoreResult:
     """Apply hard rejection rules, then calculate an explainable 0-100 score."""
     corpus = normalize(job.searchable_text)

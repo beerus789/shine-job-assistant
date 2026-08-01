@@ -7,6 +7,8 @@ limits. Every result is recorded for auditing.
 ## Safety behavior
 
 - A job is recorded as successful only after Shine displays **Applied**.
+- Search cards only prioritize candidates; the full Shine job page is loaded
+  and scored before any application is attempted.
 - External websites are never used. External redirects or tabs go directly to
   the manual-review queue.
 - Unknown questions, unsupported controls, and missing truthful answers are not
