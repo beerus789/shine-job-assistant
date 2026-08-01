@@ -21,6 +21,12 @@ The same information appears in `artifacts/scored-and-applied.json`. Automation
 failures remain in `artifacts/manual-review.json` until the job URL is recorded
 in successful application history.
 
+## Search pages load gradually
+
+The bot intentionally waits two to five seconds between search pages. This
+reduces burst traffic and gives each page time to settle. The delay does not
+apply before the first search page.
+
 ## A job redirects outside Shine
 
 The bot checks the destination before looking for an Applied button or another
@@ -44,6 +50,11 @@ One job receives 45 seconds by default. An unknown control, missing submit
 button, redirect, or expired deadline produces `needs_review`; the browser then
 moves to the next job.
 
+Questions, external redirects, and unsupported forms become `manual_only` and
+are not retried automatically. Network and timeout failures receive one retry
+after the configured cooldown; a second transient failure also becomes
+`manual_only`. This state is stored locally in `state/attempts.json`.
+
 Open `artifacts/manual-review.json` and use the saved job URL to finish it
 manually. A reason and screenshot are included when possible.
 
@@ -64,10 +75,19 @@ Confirm `.env` is in the project folder and contains non-empty `SHINE_EMAIL` and
 Look for new `error-*.png` files under `artifacts`. They show the page at the
 time of failure and help identify which selector needs updating.
 
+For deeper local diagnostics, set `ENABLE_TRACING=true`. A failed run saves
+`artifacts/trace.zip`; a clean run discards the recording. The trace starts only
+after login succeeds, but it can still contain personal profile details, job
+URLs, screenshots, and form values. Never upload or commit it. The entire
+`artifacts` directory is ignored by Git.
+
 ## Resetting history
 
 Do not delete `state/history.json` merely to rerun the program. Deleting it
 removes duplicate protection. Remove history only when you intentionally want
 the bot to forget earlier applications.
+
+Similarly, remove a URL from `state/attempts.json` only when you intentionally
+want to release it from cooldown or manual-only status.
 
 [Back to Start Here](../README.md)

@@ -11,9 +11,10 @@ import asyncio
 import csv
 import json
 import os
+import random
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
@@ -21,13 +22,14 @@ from dotenv import load_dotenv
 from playwright.async_api import BrowserContext, Locator, Page, async_playwright
 
 import config
-from scoring import Job, parse_experience, score_job
+from scoring import Job, ScoreResult, parse_experience, preliminary_job_priority, score_job
 
 BASE_URL = "https://www.shine.com"
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
 ARTIFACT_DIR = ROOT / "artifacts"
 HISTORY_FILE = STATE_DIR / "history.json"
+ATTEMPTS_FILE = STATE_DIR / "attempts.json"
 REPORT_FILE = ARTIFACT_DIR / "latest.csv"
 SCORED_AND_APPLIED_FILE = ARTIFACT_DIR / "scored-and-applied.json"
 MANUAL_REVIEW_FILE = ARTIFACT_DIR / "manual-review.json"
@@ -100,6 +102,87 @@ def load_history() -> dict[str, dict]:
 def save_history(history: dict[str, dict]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     HISTORY_FILE.write_text(json.dumps(history, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def load_attempts() -> dict[str, dict]:
+    if not ATTEMPTS_FILE.exists():
+        return {}
+    return json.loads(ATTEMPTS_FILE.read_text(encoding="utf-8"))
+
+
+def save_attempts(attempts: dict[str, dict]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ATTEMPTS_FILE.write_text(
+        json.dumps(attempts, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+
+def failure_is_transient(reason: str) -> bool:
+    """Return whether a failure is safe to retry after a cooldown."""
+    normalized = reason.lower()
+    return any(
+        signal in normalized
+        for signal in (
+            "timeout",
+            "timed out",
+            "exceeded",
+            "net::",
+            "connection",
+            "temporarily unavailable",
+        )
+    )
+
+
+def record_failed_attempt(
+    attempts: dict[str, dict],
+    job: Job,
+    reason: str,
+    now: datetime,
+    retry_delay_hours: int,
+    maximum_transient_attempts: int,
+) -> dict:
+    """Record cooldown/manual-only state without polluting success history."""
+    previous = attempts.get(job.url, {})
+    attempt_count = int(previous.get("attempt_count", 0)) + 1
+    transient = failure_is_transient(reason)
+    manual_only = not transient or attempt_count >= maximum_transient_attempts
+    retry_after = (
+        None
+        if manual_only
+        else (now + timedelta(hours=retry_delay_hours)).isoformat()
+    )
+    entry = {
+        "title": job.title,
+        "company": job.company,
+        "status": "manual_only" if manual_only else "retry_scheduled",
+        "failure_reason": reason,
+        "last_attempted_at": now.isoformat(),
+        "retry_after": retry_after,
+        "attempt_count": attempt_count,
+    }
+    attempts[job.url] = entry
+    return entry
+
+
+def attempt_hold_status(entry: dict | None, now: datetime) -> tuple[str, str] | None:
+    """Describe why an unresolved job must not be processed in this run."""
+    if not entry:
+        return None
+    if entry.get("status") == "manual_only":
+        return "manual_review_pending", "job requires manual completion"
+
+    retry_after_text = str(entry.get("retry_after") or "")
+    if not retry_after_text:
+        return None
+    try:
+        retry_after = datetime.fromisoformat(retry_after_text)
+    except ValueError:
+        return "manual_review_pending", "invalid retry state requires manual review"
+    if retry_after.tzinfo is None:
+        retry_after = retry_after.astimezone()
+    if now < retry_after:
+        return "retry_cooldown", f"automatic retry is paused until {retry_after.isoformat()}"
+    return None
 
 
 def applications_today(history: dict[str, dict]) -> int:
@@ -180,20 +263,170 @@ async def extract_jobs(page: Page) -> list[Job]:
     return jobs
 
 
-async def discover(page: Page, max_pages: int, navigation_timeout_ms: int) -> list[Job]:
+async def discover(
+    page: Page,
+    max_pages: int,
+    navigation_timeout_ms: int,
+    delay_min_seconds: int,
+    delay_max_seconds: int,
+) -> tuple[list[Job], list[dict]]:
+    """Search at a moderate pace and record each query's unique contribution."""
     discovered: dict[str, Job] = {}
+    search_metrics: list[dict] = []
+    navigation_count = 0
     for query in sorted(config.SEARCH_QUERIES):
+        metric = {
+            "query": query,
+            "pages_visited": 0,
+            "cards_found": 0,
+            "unique_jobs_added": 0,
+        }
         base_slug = f"{slugify(query)}-jobs"
         for page_number in range(1, max_pages + 1):
+            if navigation_count:
+                delay_ms = random.randint(delay_min_seconds, delay_max_seconds) * 1_000
+                await page.wait_for_timeout(delay_ms)
             suffix = "" if page_number == 1 else f"-{page_number}"
             await page.goto(
                 f"{BASE_URL}/job-search/{base_slug}{suffix}",
                 wait_until="domcontentloaded",
                 timeout=navigation_timeout_ms,
             )
-            for job in await extract_jobs(page):
+            navigation_count += 1
+            page_jobs = await extract_jobs(page)
+            unique_before = len(discovered)
+            for job in page_jobs:
                 discovered[job.url] = job
-    return list(discovered.values())
+            metric["pages_visited"] += 1
+            metric["cards_found"] += len(page_jobs)
+            metric["unique_jobs_added"] += len(discovered) - unique_before
+        search_metrics.append(metric)
+    return list(discovered.values()), search_metrics
+
+
+def merge_job_details(
+    job: Job,
+    description: str,
+    detail_skills: list[str],
+    highlights: str,
+) -> Job:
+    """Replace incomplete card fields with content from the actual job page."""
+    minimum, maximum = parse_experience(highlights)
+    unique_skills = tuple(dict.fromkeys(skill.strip() for skill in detail_skills if skill.strip()))
+    return Job(
+        title=job.title,
+        company=job.company,
+        url=job.url,
+        text="\n".join(part for part in (description.strip(), highlights.strip()) if part),
+        skills=unique_skills,
+        min_experience=minimum if minimum is not None else job.min_experience,
+        max_experience=maximum if maximum is not None else job.max_experience,
+    )
+
+
+async def extract_job_detail(
+    page: Page, job: Job, navigation_timeout_ms: int
+) -> Job:
+    """Load one Shine job page and extract its description, skills, and experience."""
+    await page.goto(job.url, wait_until="domcontentloaded", timeout=navigation_timeout_ms)
+    if not _is_shine_url(page.url):
+        raise ManualReviewRequired(
+            f"Job detail redirected outside Shine ({page.url}); the external page was not used"
+        )
+    if not _same_job_path(job.url, page.url):
+        raise ManualReviewRequired(f"Job detail redirected to {page.url}")
+
+    description_heading = page.get_by_role("heading", name="Job Description", exact=True)
+    await description_heading.wait_for(state="visible", timeout=navigation_timeout_ms)
+    if await description_heading.count() != 1:
+        raise RuntimeError("Expected one Job Description heading")
+    description_scope = description_heading.locator("xpath=following-sibling::*[1]")
+    if await description_scope.count() != 1:
+        raise RuntimeError("Job Description content was not found")
+    description = (await description_scope.inner_text()).strip()
+    if not description:
+        raise RuntimeError("Job Description is empty")
+
+    highlights = ""
+    highlights_heading = page.get_by_role("heading", name="Key Highlights", exact=True)
+    if await highlights_heading.count() == 1:
+        highlights_scope = highlights_heading.locator("xpath=following-sibling::*[1]")
+        if await highlights_scope.count() == 1:
+            highlights = (await highlights_scope.inner_text()).strip()
+
+    detail_skills: list[str] = []
+    skills_label = page.get_by_text("SKILLS", exact=True)
+    if await skills_label.count() == 1:
+        skills_scope = skills_label.locator("xpath=following-sibling::*[1]")
+        if await skills_scope.count() == 1:
+            detail_skills = await skills_scope.locator("a, li").all_inner_texts()
+            if not detail_skills:
+                detail_skills = (await skills_scope.inner_text()).splitlines()
+
+    return merge_job_details(job, description, detail_skills, highlights)
+
+
+def select_detail_candidates(
+    jobs: list[Job], maximum: int
+) -> tuple[list[Job], dict[str, str]]:
+    """Select the strongest safe card candidates for mandatory detail scoring."""
+    ranked_candidates: list[tuple[int, Job]] = []
+    skipped: dict[str, str] = {}
+    for job in jobs:
+        priority = preliminary_job_priority(job)
+        if priority is None:
+            skipped[job.url] = "rejected by title or experience before detail scoring"
+        else:
+            ranked_candidates.append((priority, job))
+
+    ranked_candidates.sort(key=lambda pair: pair[0], reverse=True)
+    selected = [job for _, job in ranked_candidates[:maximum]]
+    for _, job in ranked_candidates[maximum:]:
+        skipped[job.url] = f"detail-scoring limit reached ({maximum} jobs)"
+    return selected, skipped
+
+
+async def score_detailed_jobs(
+    page: Page,
+    jobs: list[Job],
+    maximum: int,
+    navigation_timeout_ms: int,
+    detail_timeout_seconds: int,
+) -> tuple[list[tuple[ScoreResult, Job]], dict[str, str]]:
+    """Score only enriched jobs and surface detail failures for manual review."""
+    selected, skipped = select_detail_candidates(jobs, maximum)
+    enriched: dict[str, Job] = {}
+    failures: dict[str, str] = {}
+
+    for job in selected:
+        try:
+            enriched[job.url] = await asyncio.wait_for(
+                extract_job_detail(page, job, navigation_timeout_ms),
+                timeout=detail_timeout_seconds,
+            )
+        except TimeoutError:
+            failures[job.url] = (
+                f"job-detail extraction exceeded {detail_timeout_seconds} seconds"
+            )
+        except Exception as exc:
+            failures[job.url] = f"job-detail extraction failed: {str(exc).strip() or type(exc).__name__}"
+
+    scored: list[tuple[ScoreResult, Job]] = []
+    statuses: dict[str, str] = {}
+    for job in jobs:
+        if job.url in enriched:
+            detailed_job = enriched[job.url]
+            scored.append((score_job(detailed_job), detailed_job))
+        elif job.url in failures:
+            reason = failures[job.url]
+            scored.append((ScoreResult(0, False, (reason,)), job))
+            statuses[job.url] = f"needs_review: {reason}"
+        else:
+            reason = skipped.get(job.url, "not selected for detail scoring")
+            scored.append((ScoreResult(0, False, (reason,)), job))
+
+    scored.sort(key=lambda pair: pair[0].score, reverse=True)
+    return scored, statuses
 
 
 def role_family(job: Job) -> str:
@@ -654,10 +887,16 @@ def write_report(rows: list[dict]) -> None:
 
 
 def write_json_reports(
-    rows: list[dict], dry_run: bool, history: dict[str, dict]
+    rows: list[dict],
+    dry_run: bool,
+    history: dict[str, dict],
+    attempts: dict[str, dict] | None = None,
+    search_metrics: list[dict] | None = None,
 ) -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     generated_at = datetime.now().astimezone().isoformat()
+    attempts = attempts or {}
+    search_metrics = search_metrics or []
 
     applied_jobs = [
         {
@@ -693,6 +932,7 @@ def write_json_reports(
         },
         "applied_jobs": applied_jobs,
         "scored_jobs": rows,
+        "search_metrics": search_metrics,
     }
     SCORED_AND_APPLIED_FILE.write_text(
         json.dumps(scored_payload, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -714,6 +954,18 @@ def write_json_reports(
     for applied_url in history:
         existing_items.pop(applied_url, None)
 
+    for url, item in existing_items.items():
+        attempt = attempts.get(url)
+        if attempt:
+            item.update(
+                {
+                    "automation_status": attempt.get("status"),
+                    "attempt_count": attempt.get("attempt_count", 0),
+                    "last_attempted_at": attempt.get("last_attempted_at"),
+                    "retry_after": attempt.get("retry_after"),
+                }
+            )
+
     for row in rows:
         status = str(row.get("status", ""))
         if not status.startswith("needs_review"):
@@ -729,6 +981,18 @@ def write_json_reports(
             "score": row.get("score"),
             "experience": row.get("experience", ""),
             "failure_reason": status.removeprefix("needs_review:").strip(),
+            "automation_status": attempts.get(str(row.get("url", "")), {}).get(
+                "status", "manual_only"
+            ),
+            "attempt_count": attempts.get(str(row.get("url", "")), {}).get(
+                "attempt_count", 1
+            ),
+            "last_attempted_at": attempts.get(str(row.get("url", "")), {}).get(
+                "last_attempted_at", generated_at
+            ),
+            "retry_after": attempts.get(str(row.get("url", "")), {}).get(
+                "retry_after"
+            ),
             "screenshot": (
                 f"artifacts/{screenshot_name}" if screenshot_path.exists() else None
             ),
@@ -766,20 +1030,40 @@ async def run() -> None:
     password = os.getenv("SHINE_PASSWORD", "")
     dry_run = env_bool("DRY_RUN", True)
     headless = env_bool("HEADLESS", False)
+    tracing_enabled = env_bool("ENABLE_TRACING", False)
     max_per_run = env_int("MAX_APPLICATIONS_PER_RUN", 5)
     max_per_day = env_int("MAX_APPLICATIONS_PER_DAY", 10)
     max_pages = env_int("MAX_PAGES_PER_SEARCH", 2)
+    search_delay_min_seconds = env_int("SEARCH_DELAY_MIN_SECONDS", 2)
+    search_delay_max_seconds = env_int("SEARCH_DELAY_MAX_SECONDS", 5)
     action_delay = env_int("ACTION_DELAY_SECONDS", 3)
     navigation_timeout_ms = env_int("NAVIGATION_TIMEOUT_SECONDS", 30) * 1_000
     authentication_timeout_ms = env_int("AUTH_TIMEOUT_SECONDS", 15) * 1_000
     apply_timeout_ms = env_int("APPLY_TIMEOUT_SECONDS", 15) * 1_000
     per_job_timeout_seconds = env_int("PER_JOB_TIMEOUT_SECONDS", 45)
+    detail_timeout_seconds = env_int("DETAIL_TIMEOUT_SECONDS", 20)
+    max_detail_jobs = env_int("MAX_DETAIL_JOBS_PER_RUN", 40)
+    retry_delay_hours = env_int("MANUAL_RETRY_DELAY_HOURS", 72)
+    maximum_transient_attempts = env_int("MAX_TRANSIENT_ATTEMPTS", 2)
     answers = ApplicationAnswers.from_environment()
+
+    if search_delay_min_seconds < 0 or search_delay_min_seconds > search_delay_max_seconds:
+        raise RuntimeError(
+            "SEARCH_DELAY_MIN_SECONDS must be non-negative and no greater than "
+            "SEARCH_DELAY_MAX_SECONDS"
+        )
 
     if not dry_run and (not email or not password):
         raise RuntimeError("SHINE_EMAIL and SHINE_PASSWORD are required when DRY_RUN=false")
 
     history = load_history()
+    attempts = load_attempts()
+    attempts_changed = False
+    for applied_url in history:
+        if attempts.pop(applied_url, None) is not None:
+            attempts_changed = True
+    if attempts_changed:
+        save_attempts(attempts)
     remaining_today = max(0, max_per_day - applications_today(history))
     application_budget = min(max_per_run, remaining_today)
     rows: list[dict] = []
@@ -792,15 +1076,55 @@ async def run() -> None:
         browser = await playwright.chromium.launch(headless=headless)
         context: BrowserContext = await browser.new_context()
         page = await context.new_page()
+        trace_started = False
+        trace_has_failure = False
+        run_failed = False
         try:
             if not dry_run:
                 await login(page, email, password, navigation_timeout_ms)
-            jobs = await discover(page, max_pages, navigation_timeout_ms)
-            ranked = sorted(((score_job(job), job) for job in jobs), key=lambda pair: pair[0].score, reverse=True)
+            if tracing_enabled:
+                await context.tracing.start(
+                    screenshots=True,
+                    snapshots=True,
+                    sources=True,
+                )
+                trace_started = True
+            jobs, search_metrics = await discover(
+                page,
+                max_pages,
+                navigation_timeout_ms,
+                search_delay_min_seconds,
+                search_delay_max_seconds,
+            )
+            run_started_at = datetime.now().astimezone()
+            active_jobs: list[Job] = []
+            held_jobs: list[tuple[Job, str, str]] = []
+            for job in jobs:
+                hold = attempt_hold_status(attempts.get(job.url), run_started_at)
+                if hold is None:
+                    active_jobs.append(job)
+                else:
+                    hold_status, hold_reason = hold
+                    held_jobs.append((job, hold_status, hold_reason))
+
+            ranked, detail_statuses = await score_detailed_jobs(
+                page,
+                active_jobs,
+                max_detail_jobs,
+                navigation_timeout_ms,
+                detail_timeout_seconds,
+            )
+            trace_has_failure = any(
+                status.startswith("needs_review:")
+                for status in detail_statuses.values()
+            )
+            for job, hold_status, hold_reason in held_jobs:
+                ranked.append((ScoreResult(0, False, (hold_reason,)), job))
+                detail_statuses[job.url] = hold_status
 
             applied_this_run = 0
             for result, job in ranked:
-                status = "rejected"
+                status = detail_statuses.get(job.url, "rejected")
                 if result.accepted:
                     family = role_family(job)
                     if job.url in history:
@@ -837,6 +1161,8 @@ async def run() -> None:
                                 "status": application_status,
                             }
                             save_history(history)
+                            if attempts.pop(job.url, None) is not None:
+                                save_attempts(attempts)
                             if application_status == "applied":
                                 applied_this_run += 1
                                 role_family_counts[family] = role_family_counts.get(family, 0) + 1
@@ -872,6 +1198,19 @@ async def run() -> None:
                             except Exception:
                                 pass
 
+                if status.startswith("needs_review:"):
+                    trace_has_failure = True
+                    failure_reason = status.removeprefix("needs_review:").strip()
+                    record_failed_attempt(
+                        attempts,
+                        job,
+                        failure_reason,
+                        datetime.now().astimezone(),
+                        retry_delay_hours,
+                        maximum_transient_attempts,
+                    )
+                    save_attempts(attempts)
+
                 rows.append(
                     {
                         "score": result.score,
@@ -885,8 +1224,21 @@ async def run() -> None:
                     }
                 )
             write_report(rows)
-            write_json_reports(rows, dry_run, history)
+            write_json_reports(rows, dry_run, history, attempts, search_metrics)
+        except Exception:
+            run_failed = True
+            raise
         finally:
+            if trace_started:
+                try:
+                    if trace_has_failure or run_failed:
+                        ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+                        await context.tracing.stop(path=ARTIFACT_DIR / "trace.zip")
+                    else:
+                        await context.tracing.stop()
+                except Exception:
+                    # Trace diagnostics must never hide the original run result.
+                    pass
             await context.close()
             await browser.close()
 

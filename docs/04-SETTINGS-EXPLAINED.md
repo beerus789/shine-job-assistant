@@ -7,14 +7,21 @@ settings can be adjusted using plain numbers or `true` / `false`.
 |---|---:|---|
 | `DRY_RUN` | `true` | Scores jobs without submitting applications. |
 | `HEADLESS` | `false` | The browser remains visible. |
+| `ENABLE_TRACING` | `false` | Saves a private Playwright trace only when a run fails. |
 | `MAX_APPLICATIONS_PER_RUN` | `3` | At most three successful applications per launch. |
 | `MAX_APPLICATIONS_PER_DAY` | `10` | Hard daily limit across all launches. |
 | `MAX_PAGES_PER_SEARCH` | `1` | Checks the first page of each precise search. |
+| `MAX_DETAIL_JOBS_PER_RUN` | `40` | Maximum candidate pages loaded for final scoring. |
+| `SEARCH_DELAY_MIN_SECONDS` | `2` | Minimum pause between search pages. |
+| `SEARCH_DELAY_MAX_SECONDS` | `5` | Maximum pause between search pages. |
 | `ACTION_DELAY_SECONDS` | `5` | Pause after a verified application. |
 | `NAVIGATION_TIMEOUT_SECONDS` | `30` | Maximum wait for page navigation. |
 | `AUTH_TIMEOUT_SECONDS` | `15` | Maximum wait for the signed-in job page. |
 | `APPLY_TIMEOUT_SECONDS` | `15` | Maximum wait for the Applied confirmation. |
+| `DETAIL_TIMEOUT_SECONDS` | `20` | Maximum time for one detail-page extraction. |
 | `PER_JOB_TIMEOUT_SECONDS` | `45` | Hard limit for one complete job attempt. |
+| `MANUAL_RETRY_DELAY_HOURS` | `72` | Cooldown before retrying a transient failure. |
+| `MAX_TRANSIENT_ATTEMPTS` | `2` | Failed transient attempts before manual-only status. |
 | `CANDIDATE_EXPERIENCE_YEARS` | blank | Your years of experience. |
 | `CANDIDATE_EXPERIENCE_MONTHS` | blank | Your extra months of experience. |
 | `CURRENT_SALARY_LPA` | blank | Your current annual salary, in lakhs. |
@@ -59,5 +66,8 @@ plain-text files:
 Add or remove one line and save the file. Blank lines and lines beginning with
 `#` are ignored. `config.py` only loads these files and contains the less-common
 numeric thresholds such as minimum score and maximum experience.
+
+The included search list contains ten focused queries. Review `search_metrics`
+in the main JSON report after several runs before removing another query.
 
 [Back to Start Here](../README.md)

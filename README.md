@@ -7,6 +7,8 @@ limits. Every result is recorded for auditing.
 ## Safety behavior
 
 - A job is recorded as successful only after Shine displays **Applied**.
+- Search cards only prioritize candidates; the full Shine job page is loaded
+  and scored before any application is attempted.
 - External websites are never used. External redirects or tabs go directly to
   the manual-review queue.
 - Unknown questions, unsupported controls, and missing truthful answers are not
@@ -59,6 +61,7 @@ Blank lines and lines beginning with `#` are ignored.
 - `artifacts/manual-review.json`: unresolved redirects, questions, timeouts, or
   unsupported forms.
 - `state/history.json`: local duplicate protection.
+- `state/attempts.json`: retry cooldowns and manual-only jobs.
 
 Generated reports and history stay local and are excluded from Git.
 
@@ -78,3 +81,11 @@ Generated reports and history stay local and are excluded from Git.
 ```
 
 GitHub Actions runs the same test suite for every push and pull request.
+
+For a read-only check against Shine's current public page structure:
+
+```powershell
+.\.venv\Scripts\python.exe smoke_test.py
+```
+
+The smoke test does not enter credentials or click Apply.

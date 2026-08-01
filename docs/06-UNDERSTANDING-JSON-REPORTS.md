@@ -10,6 +10,8 @@ Use this as the main record. It contains:
 - `summary`: totals and status counts from the latest run.
 - `applied_jobs`: every successful application stored in history.
 - `scored_jobs`: every job evaluated during the latest run.
+- `search_metrics`: pages, cards, and newly discovered URLs contributed by each
+  search phrase.
 
 Each scored job shows:
 
@@ -27,6 +29,9 @@ Use this only when `unresolved_count` is greater than zero. Every item contains:
 - `url`: the page to open manually.
 - `screenshot`: the captured error page when available.
 - `manual_action`: simple instructions for completing the job yourself.
+- `automation_status`: either waiting for a retry or manual-only.
+- `attempt_count`: number of failed automated attempts.
+- `retry_after`: earliest automatic retry time, or `null` for manual-only jobs.
 
 Typical failure reasons include a 45-second timeout, a redirect, an unfamiliar
 employer question, a missing `.env` answer, or a dropdown option that could not

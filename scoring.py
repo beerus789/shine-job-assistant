@@ -15,8 +15,23 @@ def normalize(value: str) -> str:
 
 
 def contains_phrase(text: str, phrase: str) -> bool:
-    """Perform a case-insensitive normalized phrase check."""
-    return normalize(phrase) in normalize(text)
+    """Match complete normalized tokens instead of arbitrary substrings.
+
+    Substring matching makes ``rag`` match ``storage`` and can turn an
+    unrelated role into a false positive. The explicit boundaries still allow
+    flexible whitespace in multi-word phrases and retain technology symbols
+    supported by :func:`normalize`, such as ``+``, ``#``, and ``.``.
+    """
+    phrase_tokens = [re.escape(token) for token in normalize(phrase).split()]
+    if not phrase_tokens:
+        return False
+
+    pattern = (
+        r"(?<![a-z0-9+#.])"
+        + r"\s+".join(phrase_tokens)
+        + r"(?![a-z0-9+#.])"
+    )
+    return re.search(pattern, normalize(text)) is not None
 
 
 @dataclass(frozen=True)
@@ -47,6 +62,27 @@ def _title_similarity(title: str) -> float:
         SequenceMatcher(None, actual, normalize(target)).ratio()
         for target in config.TARGET_TITLES
     )
+
+
+def preliminary_job_priority(job: Job) -> int | None:
+    """Rank safe detail-page candidates without making a final decision.
+
+    Search cards are incomplete, so missing skills never reject a job here.
+    Only an unsuitable title or an excessive minimum-experience requirement is
+    considered strong enough to avoid the extra detail-page request.
+    """
+    if any(contains_phrase(job.title, keyword) for keyword in config.BLOCKED_KEYWORDS):
+        return None
+    if job.min_experience is not None and job.min_experience > config.MAX_REQUIRED_EXPERIENCE:
+        return None
+
+    priority = round(_title_similarity(job.title) * 100)
+    priority += 10 * sum(
+        contains_phrase(job.searchable_text, skill) for skill in config.REQUIRED_SKILLS
+    )
+    if any(contains_phrase(job.searchable_text, signal) for signal in config.ROLE_SIGNALS):
+        priority += 5
+    return priority
 
 
 def score_job(job: Job) -> ScoreResult:

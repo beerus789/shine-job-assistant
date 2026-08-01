@@ -2,19 +2,10 @@
 python backend developer
 python backend engineer fastapi
 senior python backend developer
-backend engineer python fastapi
 software engineer ii python backend
-software development engineer ii python backend
-software development engineer iii python backend
 sde 2 python backend
 sde 3 python backend
-fastapi developer python
 django developer python
-genai engineer python
 genai backend engineer python fastapi
-rag engineer python
 rag engineer python langchain
-llm application engineer python
 agentic ai engineer python
-ai backend engineer python
-python full stack fastapi react
