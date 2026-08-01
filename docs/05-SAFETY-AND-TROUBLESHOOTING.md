@@ -21,6 +21,12 @@ The same information appears in `artifacts/scored-and-applied.json`. Automation
 failures remain in `artifacts/manual-review.json` until the job URL is recorded
 in successful application history.
 
+## Search pages load gradually
+
+The bot intentionally waits two to five seconds between search pages. This
+reduces burst traffic and gives each page time to settle. The delay does not
+apply before the first search page.
+
 ## A job redirects outside Shine
 
 The bot checks the destination before looking for an Applied button or another

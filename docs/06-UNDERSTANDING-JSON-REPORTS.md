@@ -10,6 +10,8 @@ Use this as the main record. It contains:
 - `summary`: totals and status counts from the latest run.
 - `applied_jobs`: every successful application stored in history.
 - `scored_jobs`: every job evaluated during the latest run.
+- `search_metrics`: pages, cards, and newly discovered URLs contributed by each
+  search phrase.
 
 Each scored job shows:
 

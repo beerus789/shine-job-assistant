@@ -11,6 +11,8 @@ settings can be adjusted using plain numbers or `true` / `false`.
 | `MAX_APPLICATIONS_PER_DAY` | `10` | Hard daily limit across all launches. |
 | `MAX_PAGES_PER_SEARCH` | `1` | Checks the first page of each precise search. |
 | `MAX_DETAIL_JOBS_PER_RUN` | `40` | Maximum candidate pages loaded for final scoring. |
+| `SEARCH_DELAY_MIN_SECONDS` | `2` | Minimum pause between search pages. |
+| `SEARCH_DELAY_MAX_SECONDS` | `5` | Maximum pause between search pages. |
 | `ACTION_DELAY_SECONDS` | `5` | Pause after a verified application. |
 | `NAVIGATION_TIMEOUT_SECONDS` | `30` | Maximum wait for page navigation. |
 | `AUTH_TIMEOUT_SECONDS` | `15` | Maximum wait for the signed-in job page. |
@@ -63,5 +65,8 @@ plain-text files:
 Add or remove one line and save the file. Blank lines and lines beginning with
 `#` are ignored. `config.py` only loads these files and contains the less-common
 numeric thresholds such as minimum score and maximum experience.
+
+The included search list contains ten focused queries. Review `search_metrics`
+in the main JSON report after several runs before removing another query.
 
 [Back to Start Here](../README.md)

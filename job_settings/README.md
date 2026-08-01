@@ -25,3 +25,7 @@ case-insensitive, so `FastAPI` and `fastapi` behave the same.
 Keep `python` in `required-skills.txt` unless you intentionally want to apply
 for non-Python positions. Run with `DRY_RUN=true` after a major change and
 review the generated report before enabling live applications.
+
+The main JSON report records `cards_found` and `unique_jobs_added` for every
+search query. A query that repeatedly adds no unique jobs is a good candidate
+for removal.

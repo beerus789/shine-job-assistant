@@ -11,6 +11,7 @@ import asyncio
 import csv
 import json
 import os
+import random
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -262,20 +263,45 @@ async def extract_jobs(page: Page) -> list[Job]:
     return jobs
 
 
-async def discover(page: Page, max_pages: int, navigation_timeout_ms: int) -> list[Job]:
+async def discover(
+    page: Page,
+    max_pages: int,
+    navigation_timeout_ms: int,
+    delay_min_seconds: int,
+    delay_max_seconds: int,
+) -> tuple[list[Job], list[dict]]:
+    """Search at a moderate pace and record each query's unique contribution."""
     discovered: dict[str, Job] = {}
+    search_metrics: list[dict] = []
+    navigation_count = 0
     for query in sorted(config.SEARCH_QUERIES):
+        metric = {
+            "query": query,
+            "pages_visited": 0,
+            "cards_found": 0,
+            "unique_jobs_added": 0,
+        }
         base_slug = f"{slugify(query)}-jobs"
         for page_number in range(1, max_pages + 1):
+            if navigation_count:
+                delay_ms = random.randint(delay_min_seconds, delay_max_seconds) * 1_000
+                await page.wait_for_timeout(delay_ms)
             suffix = "" if page_number == 1 else f"-{page_number}"
             await page.goto(
                 f"{BASE_URL}/job-search/{base_slug}{suffix}",
                 wait_until="domcontentloaded",
                 timeout=navigation_timeout_ms,
             )
-            for job in await extract_jobs(page):
+            navigation_count += 1
+            page_jobs = await extract_jobs(page)
+            unique_before = len(discovered)
+            for job in page_jobs:
                 discovered[job.url] = job
-    return list(discovered.values())
+            metric["pages_visited"] += 1
+            metric["cards_found"] += len(page_jobs)
+            metric["unique_jobs_added"] += len(discovered) - unique_before
+        search_metrics.append(metric)
+    return list(discovered.values()), search_metrics
 
 
 def merge_job_details(
@@ -865,10 +891,12 @@ def write_json_reports(
     dry_run: bool,
     history: dict[str, dict],
     attempts: dict[str, dict] | None = None,
+    search_metrics: list[dict] | None = None,
 ) -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     generated_at = datetime.now().astimezone().isoformat()
     attempts = attempts or {}
+    search_metrics = search_metrics or []
 
     applied_jobs = [
         {
@@ -904,6 +932,7 @@ def write_json_reports(
         },
         "applied_jobs": applied_jobs,
         "scored_jobs": rows,
+        "search_metrics": search_metrics,
     }
     SCORED_AND_APPLIED_FILE.write_text(
         json.dumps(scored_payload, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -1004,6 +1033,8 @@ async def run() -> None:
     max_per_run = env_int("MAX_APPLICATIONS_PER_RUN", 5)
     max_per_day = env_int("MAX_APPLICATIONS_PER_DAY", 10)
     max_pages = env_int("MAX_PAGES_PER_SEARCH", 2)
+    search_delay_min_seconds = env_int("SEARCH_DELAY_MIN_SECONDS", 2)
+    search_delay_max_seconds = env_int("SEARCH_DELAY_MAX_SECONDS", 5)
     action_delay = env_int("ACTION_DELAY_SECONDS", 3)
     navigation_timeout_ms = env_int("NAVIGATION_TIMEOUT_SECONDS", 30) * 1_000
     authentication_timeout_ms = env_int("AUTH_TIMEOUT_SECONDS", 15) * 1_000
@@ -1014,6 +1045,12 @@ async def run() -> None:
     retry_delay_hours = env_int("MANUAL_RETRY_DELAY_HOURS", 72)
     maximum_transient_attempts = env_int("MAX_TRANSIENT_ATTEMPTS", 2)
     answers = ApplicationAnswers.from_environment()
+
+    if search_delay_min_seconds < 0 or search_delay_min_seconds > search_delay_max_seconds:
+        raise RuntimeError(
+            "SEARCH_DELAY_MIN_SECONDS must be non-negative and no greater than "
+            "SEARCH_DELAY_MAX_SECONDS"
+        )
 
     if not dry_run and (not email or not password):
         raise RuntimeError("SHINE_EMAIL and SHINE_PASSWORD are required when DRY_RUN=false")
@@ -1041,7 +1078,13 @@ async def run() -> None:
         try:
             if not dry_run:
                 await login(page, email, password, navigation_timeout_ms)
-            jobs = await discover(page, max_pages, navigation_timeout_ms)
+            jobs, search_metrics = await discover(
+                page,
+                max_pages,
+                navigation_timeout_ms,
+                search_delay_min_seconds,
+                search_delay_max_seconds,
+            )
             run_started_at = datetime.now().astimezone()
             active_jobs: list[Job] = []
             held_jobs: list[tuple[Job, str, str]] = []
@@ -1165,7 +1208,7 @@ async def run() -> None:
                     }
                 )
             write_report(rows)
-            write_json_reports(rows, dry_run, history, attempts)
+            write_json_reports(rows, dry_run, history, attempts, search_metrics)
         finally:
             await context.close()
             await browser.close()

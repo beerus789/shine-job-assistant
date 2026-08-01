@@ -165,12 +165,21 @@ def test_json_reports_separate_scored_and_manual_jobs(tmp_path, monkeypatch):
         }
     }
 
-    bot.write_json_reports(rows, True, history)
+    search_metrics = [
+        {
+            "query": "python backend developer",
+            "pages_visited": 1,
+            "cards_found": 20,
+            "unique_jobs_added": 12,
+        }
+    ]
+    bot.write_json_reports(rows, True, history, search_metrics=search_metrics)
 
     scored = json.loads(scored_path.read_text(encoding="utf-8"))
     manual = json.loads(manual_path.read_text(encoding="utf-8"))
     assert scored["summary"]["evaluated_in_this_run"] == 2
     assert scored["summary"]["applied_jobs_in_history"] == 1
     assert len(scored["scored_jobs"]) == 2
+    assert scored["search_metrics"] == search_metrics
     assert manual["unresolved_count"] == 1
     assert manual["jobs"][0]["failure_reason"] == "screening questions"

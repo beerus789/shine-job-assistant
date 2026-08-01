@@ -12,6 +12,7 @@ def test_human_editable_settings_are_loaded():
     assert "python" in config.REQUIRED_SKILLS
     assert "fastapi" in config.PREFERRED_SKILLS
     assert "technical support" in config.BLOCKED_KEYWORDS
+    assert len(config.SEARCH_QUERIES) == 10
 
 
 def test_phrase_matching_uses_token_boundaries():
