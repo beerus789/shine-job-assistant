@@ -15,8 +15,23 @@ def normalize(value: str) -> str:
 
 
 def contains_phrase(text: str, phrase: str) -> bool:
-    """Perform a case-insensitive normalized phrase check."""
-    return normalize(phrase) in normalize(text)
+    """Match complete normalized tokens instead of arbitrary substrings.
+
+    Substring matching makes ``rag`` match ``storage`` and can turn an
+    unrelated role into a false positive. The explicit boundaries still allow
+    flexible whitespace in multi-word phrases and retain technology symbols
+    supported by :func:`normalize`, such as ``+``, ``#``, and ``.``.
+    """
+    phrase_tokens = [re.escape(token) for token in normalize(phrase).split()]
+    if not phrase_tokens:
+        return False
+
+    pattern = (
+        r"(?<![a-z0-9+#.])"
+        + r"\s+".join(phrase_tokens)
+        + r"(?![a-z0-9+#.])"
+    )
+    return re.search(pattern, normalize(text)) is not None
 
 
 @dataclass(frozen=True)

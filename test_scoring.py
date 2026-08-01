@@ -1,11 +1,20 @@
 import config
-from scoring import Job, parse_experience, score_job
+from scoring import Job, contains_phrase, parse_experience, score_job
 
 
 def test_human_editable_settings_are_loaded():
     assert "python" in config.REQUIRED_SKILLS
     assert "fastapi" in config.PREFERRED_SKILLS
     assert "technical support" in config.BLOCKED_KEYWORDS
+
+
+def test_phrase_matching_uses_token_boundaries():
+    assert contains_phrase("Building a RAG-based application", "rag")
+    assert contains_phrase("Designing a REST   API service", "rest api")
+    assert not contains_phrase("Python storage engineer", "rag")
+    assert not contains_phrase("JavaScript backend developer", "java")
+    assert not contains_phrase("CPython runtime developer", "python")
+    assert not contains_phrase("anything", "")
 
 
 def make_job(**overrides):
