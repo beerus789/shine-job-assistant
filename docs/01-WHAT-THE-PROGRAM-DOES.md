@@ -28,6 +28,7 @@ the option's position, because Shine can reorder the list.
 - `artifacts/scored-and-applied.json`: scored jobs and complete application history.
 - `artifacts/manual-review.json`: unresolved failures that can be handled manually.
 - `state/history.json`: jobs already applied to, used to prevent duplicates.
+- `state/attempts.json`: failed-attempt counts, cooldowns, and manual-only jobs.
 - `artifacts/error-*.png`: screenshots created only when a job needs review.
 
 ## What it will not do
@@ -40,5 +41,6 @@ the option's position, because Shine can reorder the list.
   and new tabs go directly to manual review.
 - It will not apply after the daily limit is reached.
 - It will not reapply to a URL already stored in application history.
+- It will not repeatedly retry an unresolved manual-only job.
 
 [Back to Start Here](../README.md)

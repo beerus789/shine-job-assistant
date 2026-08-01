@@ -44,6 +44,11 @@ One job receives 45 seconds by default. An unknown control, missing submit
 button, redirect, or expired deadline produces `needs_review`; the browser then
 moves to the next job.
 
+Questions, external redirects, and unsupported forms become `manual_only` and
+are not retried automatically. Network and timeout failures receive one retry
+after the configured cooldown; a second transient failure also becomes
+`manual_only`. This state is stored locally in `state/attempts.json`.
+
 Open `artifacts/manual-review.json` and use the saved job URL to finish it
 manually. A reason and screenshot are included when possible.
 
@@ -69,5 +74,8 @@ time of failure and help identify which selector needs updating.
 Do not delete `state/history.json` merely to rerun the program. Deleting it
 removes duplicate protection. Remove history only when you intentionally want
 the bot to forget earlier applications.
+
+Similarly, remove a URL from `state/attempts.json` only when you intentionally
+want to release it from cooldown or manual-only status.
 
 [Back to Start Here](../README.md)

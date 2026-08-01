@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 
 import bot
 from scoring import score_job
@@ -64,6 +65,64 @@ def test_full_job_details_can_rescue_an_incomplete_card():
     )
 
     assert score_job(detailed).accepted
+
+
+def test_manual_question_is_never_retried_automatically():
+    attempts = {}
+    job = bot.Job(
+        title="Backend Engineer",
+        company="Example",
+        url="https://www.shine.com/jobs/backend/example/789",
+        text="Python backend",
+    )
+    now = datetime(2026, 8, 2, 1, 30, tzinfo=timezone.utc)
+    entry = bot.record_failed_attempt(
+        attempts,
+        job,
+        "Employer screening questions require manual review",
+        now,
+        retry_delay_hours=72,
+        maximum_transient_attempts=2,
+    )
+
+    assert entry["status"] == "manual_only"
+    assert entry["retry_after"] is None
+    assert bot.attempt_hold_status(entry, now)[0] == "manual_review_pending"
+
+
+def test_transient_failure_retries_once_after_cooldown():
+    attempts = {}
+    job = bot.Job(
+        title="Backend Engineer",
+        company="Example",
+        url="https://www.shine.com/jobs/backend/example/790",
+        text="Python backend",
+    )
+    now = datetime(2026, 8, 2, 1, 30, tzinfo=timezone.utc)
+    first = bot.record_failed_attempt(
+        attempts,
+        job,
+        "application exceeded the 45-second timeout",
+        now,
+        retry_delay_hours=72,
+        maximum_transient_attempts=2,
+    )
+
+    assert first["status"] == "retry_scheduled"
+    assert bot.attempt_hold_status(first, now)[0] == "retry_cooldown"
+    after_cooldown = now + timedelta(hours=73)
+    assert bot.attempt_hold_status(first, after_cooldown) is None
+
+    second = bot.record_failed_attempt(
+        attempts,
+        job,
+        "connection timeout",
+        after_cooldown,
+        retry_delay_hours=72,
+        maximum_transient_attempts=2,
+    )
+    assert second["attempt_count"] == 2
+    assert second["status"] == "manual_only"
 
 
 def test_json_reports_separate_scored_and_manual_jobs(tmp_path, monkeypatch):

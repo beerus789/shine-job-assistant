@@ -61,6 +61,7 @@ Blank lines and lines beginning with `#` are ignored.
 - `artifacts/manual-review.json`: unresolved redirects, questions, timeouts, or
   unsupported forms.
 - `state/history.json`: local duplicate protection.
+- `state/attempts.json`: retry cooldowns and manual-only jobs.
 
 Generated reports and history stay local and are excluded from Git.
 

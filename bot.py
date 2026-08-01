@@ -13,7 +13,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
 ARTIFACT_DIR = ROOT / "artifacts"
 HISTORY_FILE = STATE_DIR / "history.json"
+ATTEMPTS_FILE = STATE_DIR / "attempts.json"
 REPORT_FILE = ARTIFACT_DIR / "latest.csv"
 SCORED_AND_APPLIED_FILE = ARTIFACT_DIR / "scored-and-applied.json"
 MANUAL_REVIEW_FILE = ARTIFACT_DIR / "manual-review.json"
@@ -100,6 +101,87 @@ def load_history() -> dict[str, dict]:
 def save_history(history: dict[str, dict]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     HISTORY_FILE.write_text(json.dumps(history, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def load_attempts() -> dict[str, dict]:
+    if not ATTEMPTS_FILE.exists():
+        return {}
+    return json.loads(ATTEMPTS_FILE.read_text(encoding="utf-8"))
+
+
+def save_attempts(attempts: dict[str, dict]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ATTEMPTS_FILE.write_text(
+        json.dumps(attempts, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+
+def failure_is_transient(reason: str) -> bool:
+    """Return whether a failure is safe to retry after a cooldown."""
+    normalized = reason.lower()
+    return any(
+        signal in normalized
+        for signal in (
+            "timeout",
+            "timed out",
+            "exceeded",
+            "net::",
+            "connection",
+            "temporarily unavailable",
+        )
+    )
+
+
+def record_failed_attempt(
+    attempts: dict[str, dict],
+    job: Job,
+    reason: str,
+    now: datetime,
+    retry_delay_hours: int,
+    maximum_transient_attempts: int,
+) -> dict:
+    """Record cooldown/manual-only state without polluting success history."""
+    previous = attempts.get(job.url, {})
+    attempt_count = int(previous.get("attempt_count", 0)) + 1
+    transient = failure_is_transient(reason)
+    manual_only = not transient or attempt_count >= maximum_transient_attempts
+    retry_after = (
+        None
+        if manual_only
+        else (now + timedelta(hours=retry_delay_hours)).isoformat()
+    )
+    entry = {
+        "title": job.title,
+        "company": job.company,
+        "status": "manual_only" if manual_only else "retry_scheduled",
+        "failure_reason": reason,
+        "last_attempted_at": now.isoformat(),
+        "retry_after": retry_after,
+        "attempt_count": attempt_count,
+    }
+    attempts[job.url] = entry
+    return entry
+
+
+def attempt_hold_status(entry: dict | None, now: datetime) -> tuple[str, str] | None:
+    """Describe why an unresolved job must not be processed in this run."""
+    if not entry:
+        return None
+    if entry.get("status") == "manual_only":
+        return "manual_review_pending", "job requires manual completion"
+
+    retry_after_text = str(entry.get("retry_after") or "")
+    if not retry_after_text:
+        return None
+    try:
+        retry_after = datetime.fromisoformat(retry_after_text)
+    except ValueError:
+        return "manual_review_pending", "invalid retry state requires manual review"
+    if retry_after.tzinfo is None:
+        retry_after = retry_after.astimezone()
+    if now < retry_after:
+        return "retry_cooldown", f"automatic retry is paused until {retry_after.isoformat()}"
+    return None
 
 
 def applications_today(history: dict[str, dict]) -> int:
@@ -779,10 +861,14 @@ def write_report(rows: list[dict]) -> None:
 
 
 def write_json_reports(
-    rows: list[dict], dry_run: bool, history: dict[str, dict]
+    rows: list[dict],
+    dry_run: bool,
+    history: dict[str, dict],
+    attempts: dict[str, dict] | None = None,
 ) -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     generated_at = datetime.now().astimezone().isoformat()
+    attempts = attempts or {}
 
     applied_jobs = [
         {
@@ -839,6 +925,18 @@ def write_json_reports(
     for applied_url in history:
         existing_items.pop(applied_url, None)
 
+    for url, item in existing_items.items():
+        attempt = attempts.get(url)
+        if attempt:
+            item.update(
+                {
+                    "automation_status": attempt.get("status"),
+                    "attempt_count": attempt.get("attempt_count", 0),
+                    "last_attempted_at": attempt.get("last_attempted_at"),
+                    "retry_after": attempt.get("retry_after"),
+                }
+            )
+
     for row in rows:
         status = str(row.get("status", ""))
         if not status.startswith("needs_review"):
@@ -854,6 +952,18 @@ def write_json_reports(
             "score": row.get("score"),
             "experience": row.get("experience", ""),
             "failure_reason": status.removeprefix("needs_review:").strip(),
+            "automation_status": attempts.get(str(row.get("url", "")), {}).get(
+                "status", "manual_only"
+            ),
+            "attempt_count": attempts.get(str(row.get("url", "")), {}).get(
+                "attempt_count", 1
+            ),
+            "last_attempted_at": attempts.get(str(row.get("url", "")), {}).get(
+                "last_attempted_at", generated_at
+            ),
+            "retry_after": attempts.get(str(row.get("url", "")), {}).get(
+                "retry_after"
+            ),
             "screenshot": (
                 f"artifacts/{screenshot_name}" if screenshot_path.exists() else None
             ),
@@ -901,12 +1011,21 @@ async def run() -> None:
     per_job_timeout_seconds = env_int("PER_JOB_TIMEOUT_SECONDS", 45)
     detail_timeout_seconds = env_int("DETAIL_TIMEOUT_SECONDS", 20)
     max_detail_jobs = env_int("MAX_DETAIL_JOBS_PER_RUN", 40)
+    retry_delay_hours = env_int("MANUAL_RETRY_DELAY_HOURS", 72)
+    maximum_transient_attempts = env_int("MAX_TRANSIENT_ATTEMPTS", 2)
     answers = ApplicationAnswers.from_environment()
 
     if not dry_run and (not email or not password):
         raise RuntimeError("SHINE_EMAIL and SHINE_PASSWORD are required when DRY_RUN=false")
 
     history = load_history()
+    attempts = load_attempts()
+    attempts_changed = False
+    for applied_url in history:
+        if attempts.pop(applied_url, None) is not None:
+            attempts_changed = True
+    if attempts_changed:
+        save_attempts(attempts)
     remaining_today = max(0, max_per_day - applications_today(history))
     application_budget = min(max_per_run, remaining_today)
     rows: list[dict] = []
@@ -923,13 +1042,27 @@ async def run() -> None:
             if not dry_run:
                 await login(page, email, password, navigation_timeout_ms)
             jobs = await discover(page, max_pages, navigation_timeout_ms)
+            run_started_at = datetime.now().astimezone()
+            active_jobs: list[Job] = []
+            held_jobs: list[tuple[Job, str, str]] = []
+            for job in jobs:
+                hold = attempt_hold_status(attempts.get(job.url), run_started_at)
+                if hold is None:
+                    active_jobs.append(job)
+                else:
+                    hold_status, hold_reason = hold
+                    held_jobs.append((job, hold_status, hold_reason))
+
             ranked, detail_statuses = await score_detailed_jobs(
                 page,
-                jobs,
+                active_jobs,
                 max_detail_jobs,
                 navigation_timeout_ms,
                 detail_timeout_seconds,
             )
+            for job, hold_status, hold_reason in held_jobs:
+                ranked.append((ScoreResult(0, False, (hold_reason,)), job))
+                detail_statuses[job.url] = hold_status
 
             applied_this_run = 0
             for result, job in ranked:
@@ -970,6 +1103,8 @@ async def run() -> None:
                                 "status": application_status,
                             }
                             save_history(history)
+                            if attempts.pop(job.url, None) is not None:
+                                save_attempts(attempts)
                             if application_status == "applied":
                                 applied_this_run += 1
                                 role_family_counts[family] = role_family_counts.get(family, 0) + 1
@@ -1005,6 +1140,18 @@ async def run() -> None:
                             except Exception:
                                 pass
 
+                if status.startswith("needs_review:"):
+                    failure_reason = status.removeprefix("needs_review:").strip()
+                    record_failed_attempt(
+                        attempts,
+                        job,
+                        failure_reason,
+                        datetime.now().astimezone(),
+                        retry_delay_hours,
+                        maximum_transient_attempts,
+                    )
+                    save_attempts(attempts)
+
                 rows.append(
                     {
                         "score": result.score,
@@ -1018,7 +1165,7 @@ async def run() -> None:
                     }
                 )
             write_report(rows)
-            write_json_reports(rows, dry_run, history)
+            write_json_reports(rows, dry_run, history, attempts)
         finally:
             await context.close()
             await browser.close()

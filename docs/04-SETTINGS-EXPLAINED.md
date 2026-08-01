@@ -17,6 +17,8 @@ settings can be adjusted using plain numbers or `true` / `false`.
 | `APPLY_TIMEOUT_SECONDS` | `15` | Maximum wait for the Applied confirmation. |
 | `DETAIL_TIMEOUT_SECONDS` | `20` | Maximum time for one detail-page extraction. |
 | `PER_JOB_TIMEOUT_SECONDS` | `45` | Hard limit for one complete job attempt. |
+| `MANUAL_RETRY_DELAY_HOURS` | `72` | Cooldown before retrying a transient failure. |
+| `MAX_TRANSIENT_ATTEMPTS` | `2` | Failed transient attempts before manual-only status. |
 | `CANDIDATE_EXPERIENCE_YEARS` | blank | Your years of experience. |
 | `CANDIDATE_EXPERIENCE_MONTHS` | blank | Your extra months of experience. |
 | `CURRENT_SALARY_LPA` | blank | Your current annual salary, in lakhs. |
