@@ -81,3 +81,11 @@ Generated reports and history stay local and are excluded from Git.
 ```
 
 GitHub Actions runs the same test suite for every push and pull request.
+
+For a read-only check against Shine's current public page structure:
+
+```powershell
+.\.venv\Scripts\python.exe smoke_test.py
+```
+
+The smoke test does not enter credentials or click Apply.

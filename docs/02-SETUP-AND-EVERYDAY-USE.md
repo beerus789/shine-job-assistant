@@ -57,4 +57,15 @@ daily limit is read from `MAX_APPLICATIONS_PER_DAY` in your `.env`.
 Click the PowerShell window and press `Ctrl+C`. A job is recorded only after
 Shine visibly confirms **Applied**.
 
+## Check whether Shine changed its pages
+
+Run the read-only smoke check:
+
+```powershell
+.\.venv\Scripts\python.exe smoke_test.py
+```
+
+It checks the public login fields, search cards, job details, skills, and main
+Apply selector. It never fills credentials or clicks Apply.
+
 [Back to Start Here](../README.md)

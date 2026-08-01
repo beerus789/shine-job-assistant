@@ -1030,6 +1030,7 @@ async def run() -> None:
     password = os.getenv("SHINE_PASSWORD", "")
     dry_run = env_bool("DRY_RUN", True)
     headless = env_bool("HEADLESS", False)
+    tracing_enabled = env_bool("ENABLE_TRACING", False)
     max_per_run = env_int("MAX_APPLICATIONS_PER_RUN", 5)
     max_per_day = env_int("MAX_APPLICATIONS_PER_DAY", 10)
     max_pages = env_int("MAX_PAGES_PER_SEARCH", 2)
@@ -1075,9 +1076,19 @@ async def run() -> None:
         browser = await playwright.chromium.launch(headless=headless)
         context: BrowserContext = await browser.new_context()
         page = await context.new_page()
+        trace_started = False
+        trace_has_failure = False
+        run_failed = False
         try:
             if not dry_run:
                 await login(page, email, password, navigation_timeout_ms)
+            if tracing_enabled:
+                await context.tracing.start(
+                    screenshots=True,
+                    snapshots=True,
+                    sources=True,
+                )
+                trace_started = True
             jobs, search_metrics = await discover(
                 page,
                 max_pages,
@@ -1102,6 +1113,10 @@ async def run() -> None:
                 max_detail_jobs,
                 navigation_timeout_ms,
                 detail_timeout_seconds,
+            )
+            trace_has_failure = any(
+                status.startswith("needs_review:")
+                for status in detail_statuses.values()
             )
             for job, hold_status, hold_reason in held_jobs:
                 ranked.append((ScoreResult(0, False, (hold_reason,)), job))
@@ -1184,6 +1199,7 @@ async def run() -> None:
                                 pass
 
                 if status.startswith("needs_review:"):
+                    trace_has_failure = True
                     failure_reason = status.removeprefix("needs_review:").strip()
                     record_failed_attempt(
                         attempts,
@@ -1209,7 +1225,20 @@ async def run() -> None:
                 )
             write_report(rows)
             write_json_reports(rows, dry_run, history, attempts, search_metrics)
+        except Exception:
+            run_failed = True
+            raise
         finally:
+            if trace_started:
+                try:
+                    if trace_has_failure or run_failed:
+                        ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+                        await context.tracing.stop(path=ARTIFACT_DIR / "trace.zip")
+                    else:
+                        await context.tracing.stop()
+                except Exception:
+                    # Trace diagnostics must never hide the original run result.
+                    pass
             await context.close()
             await browser.close()
 

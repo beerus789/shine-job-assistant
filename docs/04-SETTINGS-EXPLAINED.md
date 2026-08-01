@@ -7,6 +7,7 @@ settings can be adjusted using plain numbers or `true` / `false`.
 |---|---:|---|
 | `DRY_RUN` | `true` | Scores jobs without submitting applications. |
 | `HEADLESS` | `false` | The browser remains visible. |
+| `ENABLE_TRACING` | `false` | Saves a private Playwright trace only when a run fails. |
 | `MAX_APPLICATIONS_PER_RUN` | `3` | At most three successful applications per launch. |
 | `MAX_APPLICATIONS_PER_DAY` | `10` | Hard daily limit across all launches. |
 | `MAX_PAGES_PER_SEARCH` | `1` | Checks the first page of each precise search. |

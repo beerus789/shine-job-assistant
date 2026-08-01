@@ -75,6 +75,12 @@ Confirm `.env` is in the project folder and contains non-empty `SHINE_EMAIL` and
 Look for new `error-*.png` files under `artifacts`. They show the page at the
 time of failure and help identify which selector needs updating.
 
+For deeper local diagnostics, set `ENABLE_TRACING=true`. A failed run saves
+`artifacts/trace.zip`; a clean run discards the recording. The trace starts only
+after login succeeds, but it can still contain personal profile details, job
+URLs, screenshots, and form values. Never upload or commit it. The entire
+`artifacts` directory is ignored by Git.
+
 ## Resetting history
 
 Do not delete `state/history.json` merely to rerun the program. Deleting it
