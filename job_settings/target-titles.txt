@@ -1,0 +1,25 @@
+# Titles that should be treated as similar to the desired roles.
+python backend developer
+python backend engineer
+backend engineer
+backend software engineer
+senior backend developer
+senior python developer
+software engineer ii
+software engineer ii backend
+software development engineer ii
+software development engineer iii
+sde 2
+sde 3
+sde ii
+sde iii
+fastapi developer
+django developer
+genai engineer
+generative ai engineer
+rag engineer
+llm application engineer
+agentic ai engineer
+applied ai engineer
+ai backend engineer
+full stack python developer

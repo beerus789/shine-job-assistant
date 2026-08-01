@@ -1,0 +1,26 @@
+# A matching phrase rejects the job immediately.
+technical support
+desktop support
+sales executive
+php only
+.net only
+java only
+unpaid internship
+internship
+trainee
+fresher
+software development engineer in test
+sdet
+api testing
+qa automation
+android
+kotlin
+firmware
+embedded
+network engineer
+data engineer
+devops engineer
+technical sales
+sales engineer
+mlops engineer
+machine learning research

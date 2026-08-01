@@ -1,0 +1,30 @@
+# Preferred resume skills. One skill or phrase per line.
+fastapi
+django
+flask
+postgresql
+postgres
+redis
+mysql
+celery
+rabbitmq
+websockets
+asyncio
+aws
+gcp
+docker
+react
+rest api
+microservices
+openai
+rag
+langchain
+langgraph
+llm
+agentic ai
+vector search
+embeddings
+re-ranking
+chromadb
+opencv
+amazon q business

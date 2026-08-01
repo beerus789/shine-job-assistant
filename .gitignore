@@ -1,0 +1,24 @@
+# Credentials and local overrides
+.env
+.env.*
+!.env.example
+
+# Python environments and generated caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime data can contain job history, URLs, and screenshots
+artifacts/
+state/
+*.log
+
+# Editor and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

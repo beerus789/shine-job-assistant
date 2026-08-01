@@ -1,0 +1,2 @@
+# Every accepted job must mention every skill in this file.
+python

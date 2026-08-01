@@ -1,0 +1,21 @@
+# At least one phrase must prove the role is backend or applied AI work.
+backend
+back end
+fastapi
+django
+flask
+rest api
+microservices
+genai
+generative ai
+rag
+llm
+langchain
+langgraph
+agentic ai
+applied ai
+ai assistant
+retrieval
+vector search
+websockets
+asynchronous processing
