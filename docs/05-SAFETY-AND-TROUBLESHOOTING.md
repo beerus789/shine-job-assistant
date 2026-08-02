@@ -70,6 +70,17 @@ person rather than guessed.
 Confirm `.env` is in the project folder and contains non-empty `SHINE_EMAIL` and
 `SHINE_PASSWORD` values. Do not add spaces around `=`.
 
+## The terminal says "Connection closed while reading from the driver"
+
+This message means Chromium or Playwright disconnected while the program was
+closing the browser. Current versions of the project safely handle that
+shutdown race. If it appears with an older copy, pull the latest code.
+
+Check the modification time of `artifacts/scored-and-applied.json`. If it was
+updated by the run, the evaluation report was saved before shutdown. Also check
+the report's `mode`: `dry_run` evaluates and shortlists jobs but deliberately
+does not submit any applications.
+
 ## The website layout changes
 
 Look for new `error-*.png` files under `artifacts`. They show the page at the

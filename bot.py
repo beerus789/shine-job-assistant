@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 from dotenv import load_dotenv
-from playwright.async_api import BrowserContext, Locator, Page, async_playwright
+from playwright.async_api import Browser, BrowserContext, Locator, Page, async_playwright
 
 import config
 from scoring import Job, ScoreResult, parse_experience, preliminary_job_priority, score_job
@@ -1024,6 +1024,46 @@ def write_json_reports(
 # ---------------------------------------------------------------------------
 
 
+def _is_expected_browser_shutdown_error(error: Exception) -> bool:
+    """Return whether Playwright is reporting an already-closed browser."""
+
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "connection closed while reading from the driver",
+            "target page, context or browser has been closed",
+            "browser has been closed",
+        )
+    )
+
+
+async def close_browser_resources(context: BrowserContext, browser: Browser) -> None:
+    """Close Playwright resources without failing when Chromium closed first.
+
+    A user can close the visible browser, or Chromium can exit after the work is
+    complete. In either case the Playwright transport may already be gone when
+    the ``finally`` block runs. Unknown cleanup errors are still raised.
+    """
+
+    cleanup_error: Exception | None = None
+    try:
+        await context.close()
+    except Exception as error:
+        if not _is_expected_browser_shutdown_error(error):
+            cleanup_error = error
+
+    try:
+        if browser.is_connected():
+            await browser.close()
+    except Exception as error:
+        if cleanup_error is None and not _is_expected_browser_shutdown_error(error):
+            cleanup_error = error
+
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
 async def run() -> None:
     load_dotenv(ROOT / ".env")
     email = os.getenv("SHINE_EMAIL", "")
@@ -1239,8 +1279,13 @@ async def run() -> None:
                 except Exception:
                     # Trace diagnostics must never hide the original run result.
                     pass
-            await context.close()
-            await browser.close()
+            try:
+                await close_browser_resources(context, browser)
+            except Exception:
+                # If the workflow already failed, preserve that original error
+                # instead of replacing it with a secondary cleanup exception.
+                if not run_failed:
+                    raise
 
     print(f"Wrote {len(rows)} evaluated jobs to {REPORT_FILE}")
     print("DRY RUN: no applications were submitted" if dry_run else "Application run complete")

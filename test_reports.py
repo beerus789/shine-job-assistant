@@ -1,7 +1,9 @@
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 
 import bot
+import pytest
 from scoring import score_job
 
 
@@ -23,6 +25,65 @@ def test_only_https_shine_urls_are_allowed():
     assert not bot._is_shine_url("http://www.shine.com/jobs/example/123")
     assert not bot._is_shine_url("https://shine.com.example.org/jobs/123")
     assert not bot._is_shine_url("https://external-employer.example/apply")
+
+
+def test_browser_cleanup_ignores_driver_disconnect_race():
+    class FakeContext:
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        close_attempted = False
+
+        def is_connected(self):
+            return True
+
+        async def close(self):
+            self.close_attempted = True
+            raise Exception(
+                "Browser.close: Connection closed while reading from the driver"
+            )
+
+    browser = FakeBrowser()
+    asyncio.run(bot.close_browser_resources(FakeContext(), browser))
+
+    assert browser.close_attempted
+
+
+def test_browser_cleanup_skips_an_already_disconnected_browser():
+    class FakeContext:
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        close_attempted = False
+
+        def is_connected(self):
+            return False
+
+        async def close(self):
+            self.close_attempted = True
+
+    browser = FakeBrowser()
+    asyncio.run(bot.close_browser_resources(FakeContext(), browser))
+
+    assert not browser.close_attempted
+
+
+def test_browser_cleanup_preserves_unexpected_errors():
+    class FakeContext:
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        def is_connected(self):
+            return True
+
+        async def close(self):
+            raise RuntimeError("unexpected cleanup failure")
+
+    with pytest.raises(RuntimeError, match="unexpected cleanup failure"):
+        asyncio.run(bot.close_browser_resources(FakeContext(), FakeBrowser()))
 
 
 def test_full_job_details_replace_misleading_card_content():
