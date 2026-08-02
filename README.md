@@ -6,7 +6,9 @@ limits. Every result is recorded for auditing.
 
 ## Safety behavior
 
-- A job is recorded as successful only after Shine displays **Applied**.
+- A new job is recorded as successful only after Shine returns HTTP 200/201
+  for that exact job ID and the current job still displays disabled **Applied**
+  after a fresh reload.
 - Search cards only prioritize candidates; the full Shine job page is loaded
   and scored before any application is attempted.
 - External websites are never used. External redirects or tabs go directly to

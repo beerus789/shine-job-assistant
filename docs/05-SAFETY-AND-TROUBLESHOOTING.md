@@ -21,6 +21,13 @@ The same information appears in `artifacts/scored-and-applied.json`. Automation
 failures remain in `artifacts/manual-review.json` until the job URL is recorded
 in successful application history.
 
+Shine's **My Jobs → Applied** tab can briefly keep showing Recommended Jobs
+after the tab is selected. During live verification it took about five seconds
+to replace that content. The settled page exposed only the latest 20 applied
+jobs and did not show pagination controls, so older confirmed applications may
+not be visible there. Open an individual job URL and check its disabled primary
+`Applied` button when reconciling an older entry.
+
 ## Search pages load gradually
 
 The bot intentionally waits two to five seconds between search pages. This
@@ -58,6 +65,13 @@ after the configured cooldown; a second transient failure also becomes
 Open `artifacts/manual-review.json` and use the saved job URL to finish it
 manually. A reason and screenshot are included when possible.
 
+Every active `error-*.png` directly inside `artifacts` belongs to an entry in
+`manual-review.json`. Screenshots from older runs or jobs later confirmed as
+applied are moved to `artifacts/stale-screenshots`; they are retained only as
+diagnostics and do not represent current failures. Screenshot filenames include
+a short job identifier so listings with the same title cannot overwrite one
+another.
+
 ## Salary or experience was not selected
 
 Check the corresponding `.env` value and the failure reason in
@@ -69,6 +83,17 @@ person rather than guessed.
 
 Confirm `.env` is in the project folder and contains non-empty `SHINE_EMAIL` and
 `SHINE_PASSWORD` values. Do not add spaces around `=`.
+
+## The terminal says "Connection closed while reading from the driver"
+
+This message means Chromium or Playwright disconnected while the program was
+closing the browser. Current versions of the project safely handle that
+shutdown race. If it appears with an older copy, pull the latest code.
+
+Check the modification time of `artifacts/scored-and-applied.json`. If it was
+updated by the run, the evaluation report was saved before shutdown. Also check
+the report's `mode`: `dry_run` evaluates and shortlists jobs but deliberately
+does not submit any applications.
 
 ## The website layout changes
 

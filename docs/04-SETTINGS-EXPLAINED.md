@@ -10,6 +10,7 @@ settings can be adjusted using plain numbers or `true` / `false`.
 | `ENABLE_TRACING` | `false` | Saves a private Playwright trace only when a run fails. |
 | `MAX_APPLICATIONS_PER_RUN` | `3` | At most three successful applications per launch. |
 | `MAX_APPLICATIONS_PER_DAY` | `10` | Hard daily limit across all launches. |
+| `MAX_APPLICATIONS_PER_ROLE_FAMILY` | `2` | Diversity cap for one role family per launch. |
 | `MAX_PAGES_PER_SEARCH` | `1` | Checks the first page of each precise search. |
 | `MAX_DETAIL_JOBS_PER_RUN` | `40` | Maximum candidate pages loaded for final scoring. |
 | `SEARCH_DELAY_MIN_SECONDS` | `2` | Minimum pause between search pages. |

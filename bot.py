@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import json
 import os
 import random
@@ -19,7 +20,14 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 from dotenv import load_dotenv
-from playwright.async_api import BrowserContext, Locator, Page, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Locator,
+    Page,
+    Response,
+    async_playwright,
+)
 
 import config
 from scoring import Job, ScoreResult, parse_experience, preliminary_job_priority, score_job
@@ -63,6 +71,50 @@ class ApplicationAnswers:
         )
 
 
+@dataclass(frozen=True)
+class ApplicationOutcome:
+    """A job result together with the evidence used to confirm it."""
+
+    status: str
+    job_id: str
+    confirmation_method: str
+    verified_at: str
+    response_status: int | None = None
+    response_job_id: str | None = None
+
+    def confirmation_record(self) -> dict:
+        return {
+            "method": self.confirmation_method,
+            "job_id": self.job_id,
+            "verified_at": self.verified_at,
+            "response_status": self.response_status,
+            "response_job_id": self.response_job_id,
+        }
+
+
+_QUESTION_PREFIX = r"^\s*(?:\d+[.)]\s*)?"
+EXPERIENCE_FIELD_PATTERN = re.compile(
+    _QUESTION_PREFIX
+    + r"(?:total\s+)?(?:work\s+)?experience(?:\s+in\s+years)?\s*\*?$",
+    re.I,
+)
+CURRENT_SALARY_FIELD_PATTERN = re.compile(
+    _QUESTION_PREFIX
+    + r"(?:(?:what\s+is\s+your\s+)?current\s+(?:annual\s+)?(?:salary|ctc)|"
+    r"total\s+annual\s+salary).*",
+    re.I,
+)
+EXPECTED_SALARY_FIELD_PATTERN = re.compile(
+    _QUESTION_PREFIX
+    + r"(?:what\s+is\s+your\s+)?expected\s+(?:annual\s+)?(?:salary|ctc).*",
+    re.I,
+)
+NOTICE_PERIOD_FIELD_PATTERN = re.compile(
+    _QUESTION_PREFIX + r"(?:what\s+is\s+your\s+)?notice\s+period.*",
+    re.I,
+)
+
+
 def env_bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -86,6 +138,14 @@ def env_optional_int(name: str) -> int | None:
 
 def slugify(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+def error_screenshot_path(title: str, url: str) -> Path:
+    """Return a stable, collision-resistant screenshot path for one job."""
+
+    title_slug = slugify(title)[:45] or "job"
+    job_key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+    return ARTIFACT_DIR / f"error-{title_slug}-{job_key}.png"
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +174,20 @@ def save_attempts(attempts: dict[str, dict]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     ATTEMPTS_FILE.write_text(
         json.dumps(attempts, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+
+def history_entry_is_verified(item: dict) -> bool:
+    """Return whether a saved success has job-specific confirmation evidence."""
+
+    if item.get("status") not in {"applied", "already_applied"}:
+        return False
+    confirmation = item.get("confirmation")
+    if not isinstance(confirmation, dict):
+        return False
+    return all(
+        str(confirmation.get(field, "")).strip()
+        for field in ("method", "job_id", "verified_at")
     )
 
 
@@ -187,7 +261,12 @@ def attempt_hold_status(entry: dict | None, now: datetime) -> tuple[str, str] | 
 
 def applications_today(history: dict[str, dict]) -> int:
     today = date.today().isoformat()
-    return sum(1 for item in history.values() if item.get("applied_at", "").startswith(today))
+    return sum(
+        1
+        for item in history.values()
+        if history_entry_is_verified(item)
+        and item.get("applied_at", "").startswith(today)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +643,16 @@ async def _select_native_option(
 
 
 async def _field_container(label: Locator, minimum_custom_selects: int = 1) -> Locator:
+    # Shine questionnaire cards render a label in one list item and its
+    # dropdown in the immediately following list item. Resolve that pair first
+    # so a later field cannot accidentally reuse the modal's first dropdown.
+    paired_list_item = label.locator(
+        "xpath=ancestor::li[1]/following-sibling::li[1]"
+        "[.//select or .//div[contains(@class,'customSelect_customSelect')]][1]"
+    )
+    if await paired_list_item.count():
+        return paired_list_item
+
     custom_xpath = (
         "ancestor::div[count(.//div[contains(@class,'customSelect_customSelect')]) "
         f">= {minimum_custom_selects}][1]"
@@ -610,10 +699,7 @@ async def complete_known_application_fields(
 ) -> int:
     """Fill only facts supplied by the user; never infer employer answers."""
     handled = 0
-    experience_pattern = re.compile(
-        r"^(?:total\s+)?(?:work\s+)?experience(?:\s+in\s+years)?\s*\*?$", re.I
-    )
-    experience_label = await _find_field_label(scope, experience_pattern)
+    experience_label = await _find_field_label(scope, EXPERIENCE_FIELD_PATTERN)
     if experience_label is not None:
         if answers.experience_years is None or answers.experience_months is None:
             raise ManualReviewRequired(
@@ -642,23 +728,19 @@ async def complete_known_application_fields(
 
     known_fields = (
         (
-            re.compile(
-                r"^(?:(?:what\s+is\s+your\s+)?current\s+(?:annual\s+)?(?:salary|ctc)|"
-                r"total\s+annual\s+salary).*",
-                re.I,
-            ),
+            CURRENT_SALARY_FIELD_PATTERN,
             answers.current_salary_lpa,
             "CURRENT_SALARY_LPA",
             "current salary",
         ),
         (
-            re.compile(r"^(?:what\s+is\s+your\s+)?expected\s+(?:annual\s+)?(?:salary|ctc).*", re.I),
+            EXPECTED_SALARY_FIELD_PATTERN,
             answers.expected_salary_lpa,
             "EXPECTED_SALARY_LPA",
             "expected salary",
         ),
         (
-            re.compile(r"^(?:what\s+is\s+your\s+)?notice\s+period.*", re.I),
+            NOTICE_PERIOD_FIELD_PATTERN,
             answers.notice_period_days,
             "NOTICE_PERIOD_DAYS",
             "notice period",
@@ -728,7 +810,18 @@ async def _unknown_required_controls(scope: Locator) -> list[str]:
     labels = scope.locator('label:visible, legend:visible, [class*="question"]:visible')
     label_count = await labels.count()
     for index in range(label_count):
-        description = re.sub(r"\s+", " ", (await labels.nth(index).inner_text()).strip())
+        candidate = labels.nth(index)
+        tag_name = await candidate.evaluate("element => element.tagName.toLowerCase()")
+        if tag_name not in {"label", "legend"}:
+            interactive_children = candidate.locator(
+                'input, textarea, select, [role="radio"], [role="checkbox"], '
+                'div[class*="customSelect_customSelect"]'
+            )
+            if await interactive_children.count() == 0:
+                # Shine's modal heading class contains "question" even though
+                # the heading is not an application field.
+                continue
+        description = re.sub(r"\s+", " ", (await candidate.inner_text()).strip())
         if description and not known.search(description):
             details.append(description[:180])
     return list(dict.fromkeys(details))
@@ -753,10 +846,17 @@ async def _visible_exact_button(scope: Locator, names: tuple[str, ...]) -> Locat
 
 
 async def _reject_new_application_tabs(
-    page: Page, pages_before_click: tuple[Page, ...]
+    page: Page,
+    pages_before_click: tuple[Page, ...],
+    observed_pages: list[Page] | None = None,
 ) -> None:
     """Close any new tab and require manual review without interacting with it."""
-    new_pages = [candidate for candidate in page.context.pages if candidate not in pages_before_click]
+    candidates = list(observed_pages or []) + list(page.context.pages)
+    new_pages: list[Page] = []
+    for candidate in candidates:
+        if candidate in pages_before_click or candidate in new_pages:
+            continue
+        new_pages.append(candidate)
     if not new_pages:
         return
 
@@ -777,6 +877,102 @@ async def _reject_new_application_tabs(
     )
 
 
+def _matches_job_apply_response(response: Response, job_id: str) -> bool:
+    """Match only Shine's application response for the current job ID."""
+
+    parsed = urlsplit(response.url)
+    if not _is_shine_url(response.url):
+        return False
+    if not parsed.path.rstrip("/").endswith("/job-apply"):
+        return False
+    if response.request.method.upper() != "POST":
+        return False
+    try:
+        payload = response.request.post_data_json
+    except Exception:
+        return False
+    return isinstance(payload, dict) and str(payload.get("job_id", "")) == str(job_id)
+
+
+async def _validate_job_apply_response(response: Response, job_id: str) -> tuple[int, str]:
+    """Require a successful response body for exactly the requested job."""
+
+    if response.status not in {200, 201}:
+        raise ManualReviewRequired(
+            f"Shine application API returned HTTP {response.status} for the current job"
+        )
+    try:
+        payload = await response.json()
+    except Exception as exc:
+        raise ManualReviewRequired(
+            "Shine application API returned an unreadable confirmation"
+        ) from exc
+    response_job_id = str(payload.get("job_id", "")) if isinstance(payload, dict) else ""
+    if response_job_id != str(job_id):
+        raise ManualReviewRequired(
+            "Shine application confirmation referenced a different job ID"
+        )
+    return response.status, response_job_id
+
+
+def _current_job_applied_button(page: Page) -> Locator:
+    """Locate the disabled Applied button in the primary job-detail card only."""
+
+    return page.locator('button[class*="jdCard_jdBtn"]').filter(
+        has_text=re.compile(r"^\s*Applied\s*$", re.I)
+    )
+
+
+async def _current_job_is_applied(page: Page) -> bool:
+    button = _current_job_applied_button(page)
+    if await button.count() != 1:
+        return False
+    return await button.is_visible() and await button.is_disabled()
+
+
+async def _verify_persisted_application(
+    page: Page,
+    job: Job,
+    navigation_timeout_ms: int,
+    authentication_timeout_ms: int,
+) -> None:
+    """Reload the job and require its primary card to remain Applied."""
+
+    await page.goto(job.url, wait_until="domcontentloaded", timeout=navigation_timeout_ms)
+    if not _is_shine_url(page.url) or not _same_job_path(job.url, page.url):
+        raise ManualReviewRequired(
+            f"Could not recheck the applied job because it redirected to {page.url}"
+        )
+    await page.get_by_text("skills matched with your profile", exact=False).wait_for(
+        state="visible", timeout=authentication_timeout_ms
+    )
+    applied = _current_job_applied_button(page)
+    try:
+        await applied.wait_for(state="visible", timeout=authentication_timeout_ms)
+    except Exception as exc:
+        raise ManualReviewRequired(
+            "Shine accepted the application request but Applied did not persist after reload"
+        ) from exc
+    if await applied.count() != 1 or not await applied.is_disabled():
+        raise ManualReviewRequired(
+            "Shine accepted the application request but the current job is not persistently Applied"
+        )
+
+
+async def _wait_for_application_response(
+    response_future: asyncio.Future[Response], timeout_ms: int
+) -> Response | None:
+    if response_future.done():
+        return response_future.result()
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(response_future),
+            timeout=max(timeout_ms, 0) / 1_000,
+        )
+    except TimeoutError:
+        return None
+
+
 async def apply_to_job(
     page: Page,
     job: Job,
@@ -784,7 +980,7 @@ async def apply_to_job(
     authentication_timeout_ms: int,
     apply_timeout_ms: int,
     answers: ApplicationAnswers,
-) -> str:
+) -> ApplicationOutcome:
     if not _is_shine_url(job.url):
         raise ManualReviewRequired(
             f"Job URL is outside the Shine portal ({job.url}); no external page was opened"
@@ -798,6 +994,8 @@ async def apply_to_job(
         raise ManualReviewRequired(
             f"Job navigation left the Shine portal ({page.url}); the external page was not used"
         )
+    if not _same_job_path(job.url, page.url):
+        raise ManualReviewRequired(f"Job navigation redirected to {page.url}")
 
     # Shine initially renders the signed-out version of a job page and then
     # hydrates the authenticated state. Do not click until that transition is
@@ -809,22 +1007,56 @@ async def apply_to_job(
         state="visible", timeout=authentication_timeout_ms
     )
 
-    applied_button = page.get_by_role("button", name="Applied", exact=True)
-    if await applied_button.count() == 1:
-        return "already_applied"
-
     job_id = job.url.rstrip("/").rsplit("/", 1)[-1]
+    if await _current_job_is_applied(page):
+        return ApplicationOutcome(
+            status="already_applied",
+            job_id=job_id,
+            confirmation_method="persisted_current_job_button",
+            verified_at=datetime.now().astimezone().isoformat(),
+        )
+
     button = page.locator(f'button[id="id_apply_{job_id}"]')
     count = await button.count()
     if count != 1:
         raise RuntimeError(f"Expected one primary Apply button; found {count}")
-    pages_before_click = tuple(page.context.pages)
-    await button.click()
 
-    for _ in range(3):
-        await page.wait_for_timeout(500)
-        await _reject_new_application_tabs(page, pages_before_click)
-        # Check the origin before reading or clicking anything on the result page.
+    response_future: asyncio.Future[Response] = asyncio.get_running_loop().create_future()
+    pages_before_click = tuple(page.context.pages)
+    observed_pages: list[Page] = []
+    unsafe_navigation_urls: list[str] = []
+
+    def observe_application_response(response: Response) -> None:
+        if response_future.done():
+            return
+        if _matches_job_apply_response(response, job_id):
+            response_future.set_result(response)
+
+    def observe_application_page(candidate: Page) -> None:
+        if candidate not in pages_before_click and candidate not in observed_pages:
+            observed_pages.append(candidate)
+
+    def observe_application_navigation(frame) -> None:
+        if frame != page.main_frame:
+            return
+        destination = frame.url
+        if not _is_shine_url(destination) or not _same_job_path(job.url, destination):
+            unsafe_navigation_urls.append(destination)
+
+    async def require_safe_application_destination() -> None:
+        await _reject_new_application_tabs(
+            page,
+            pages_before_click,
+            observed_pages,
+        )
+        if unsafe_navigation_urls:
+            destination = unsafe_navigation_urls[-1]
+            if not _is_shine_url(destination):
+                raise ManualReviewRequired(
+                    f"Application redirected to an external website ({destination}); "
+                    "the external page was not used"
+                )
+            raise ManualReviewRequired(f"Application redirected to {destination}")
         if not _is_shine_url(page.url):
             raise ManualReviewRequired(
                 f"Application redirected to an external website ({page.url}); "
@@ -832,49 +1064,116 @@ async def apply_to_job(
             )
         if not _same_job_path(job.url, page.url):
             raise ManualReviewRequired(f"Application redirected to {page.url}")
-        if await applied_button.count() == 1 and await applied_button.is_visible():
-            return "applied"
 
-        body = (await page.locator("body").inner_text()).lower()
-        if any(
-            signal in body
-            for signal in (
-                "screening question",
-                "answer the following",
-                "additional questions",
-                "employer questions",
-            )
-        ):
-            raise ManualReviewRequired("Employer screening questions require manual review")
-
-        scope = await _application_scope(page)
-        if scope is None:
-            try:
-                await applied_button.wait_for(state="visible", timeout=apply_timeout_ms)
-                return "applied"
-            except Exception as exc:
-                raise ManualReviewRequired(
-                    "Shine did not confirm Applied and no supported application form appeared"
-                ) from exc
-
-        handled = await complete_known_application_fields(page, scope, answers)
-        unknown_controls = await _unknown_required_controls(scope)
-        if unknown_controls:
-            raise ManualReviewRequired(
-                "Unfamiliar application questions: " + "; ".join(unknown_controls[:3])
-            )
-        if handled == 0:
-            raise ManualReviewRequired("An unfamiliar application form requires manual answers")
-
-        submit = await _visible_exact_button(
-            scope,
-            ("Submit Application", "Submit", "Save & Apply", "Continue", "Next", "Apply Now"),
+    async def confirmed_outcome(response: Response) -> ApplicationOutcome:
+        response_status, response_job_id = await _validate_job_apply_response(
+            response, job_id
         )
-        if submit is None:
-            raise ManualReviewRequired("Known fields were filled, but no supported submit button was found")
-        await submit.click()
+        # A submission script can redirect or open an employer tab after the API
+        # response arrives. Give that browser work a chance to run and reject it
+        # before the exact-job reload below could hide what happened.
+        await page.wait_for_timeout(500)
+        await require_safe_application_destination()
+        await _verify_persisted_application(
+            page,
+            job,
+            navigation_timeout_ms,
+            authentication_timeout_ms,
+        )
+        # Keep the event sentinels active through a short settled-state window
+        # after reload. This catches popups or delayed redirects that a one-time
+        # URL check before reload would miss.
+        await page.wait_for_timeout(500)
+        await require_safe_application_destination()
+        return ApplicationOutcome(
+            status="applied",
+            job_id=job_id,
+            confirmation_method="shine_api_and_persisted_current_job_button",
+            verified_at=datetime.now().astimezone().isoformat(),
+            response_status=response_status,
+            response_job_id=response_job_id,
+        )
 
-    raise ManualReviewRequired("Application did not finish after three form steps")
+    page.on("response", observe_application_response)
+    page.on("framenavigated", observe_application_navigation)
+    page.context.on("page", observe_application_page)
+    try:
+        await button.click()
+
+        for _ in range(3):
+            await page.wait_for_timeout(500)
+            # Check the origin before reading or clicking anything on the result page.
+            await require_safe_application_destination()
+
+            response = await _wait_for_application_response(response_future, 0)
+            if response is not None:
+                return await confirmed_outcome(response)
+
+            body = (await page.locator("body").inner_text()).lower()
+            if any(
+                signal in body
+                for signal in (
+                    "screening question",
+                    "answer the following",
+                    "additional questions",
+                    "employer questions",
+                )
+            ):
+                raise ManualReviewRequired("Employer screening questions require manual review")
+
+            scope = await _application_scope(page)
+            if scope is None:
+                response = await _wait_for_application_response(
+                    response_future, apply_timeout_ms
+                )
+                if response is not None:
+                    return await confirmed_outcome(response)
+                raise ManualReviewRequired(
+                    "No matching Shine application response and no supported form appeared"
+                )
+
+            handled = await complete_known_application_fields(page, scope, answers)
+            unknown_controls = await _unknown_required_controls(scope)
+            if unknown_controls:
+                raise ManualReviewRequired(
+                    "Unfamiliar application questions: " + "; ".join(unknown_controls[:3])
+                )
+            if handled == 0:
+                raise ManualReviewRequired("An unfamiliar application form requires manual answers")
+
+            submit = await _visible_exact_button(
+                scope,
+                (
+                    "Submit Application",
+                    "Submit and apply",
+                    "Submit & Apply",
+                    "Submit",
+                    "Save & Apply",
+                    "Continue",
+                    "Next",
+                    "Apply Now",
+                ),
+            )
+            if submit is None:
+                raise ManualReviewRequired(
+                    "Known fields were filled, but no supported submit button was found"
+                )
+            await submit.click()
+            await page.wait_for_timeout(250)
+            await require_safe_application_destination()
+            response = await _wait_for_application_response(
+                response_future, min(apply_timeout_ms, 5_000)
+            )
+            if response is not None:
+                return await confirmed_outcome(response)
+
+        raise ManualReviewRequired(
+            "Application form finished without a matching Shine application response"
+        )
+    finally:
+        page.remove_listener("response", observe_application_response)
+        page.remove_listener("framenavigated", observe_application_navigation)
+        page.context.remove_listener("page", observe_application_page)
 
 
 def write_report(rows: list[dict]) -> None:
@@ -884,6 +1183,44 @@ def write_report(rows: list[dict]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def archive_unreferenced_error_screenshots(manual_jobs: list[dict]) -> int:
+    """Move legacy or resolved screenshots out of the active artifact folder.
+
+    Files directly under ``artifacts`` should correspond to the current manual
+    queue. Older diagnostics remain recoverable under ``stale-screenshots``.
+    """
+
+    referenced_names = {
+        Path(str(item["screenshot"])).name
+        for item in manual_jobs
+        if item.get("screenshot")
+    }
+    stale_paths = [
+        path
+        for path in ARTIFACT_DIR.glob("error-*.png")
+        if path.name not in referenced_names
+    ]
+    if not stale_paths:
+        return 0
+
+    archive_dir = ARTIFACT_DIR / "stale-screenshots"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archived_count = 0
+    for source in stale_paths:
+        destination = archive_dir / source.name
+        counter = 1
+        while destination.exists():
+            destination = archive_dir / f"{source.stem}-{counter}{source.suffix}"
+            counter += 1
+        try:
+            source.replace(destination)
+            archived_count += 1
+        except OSError:
+            # Artifact housekeeping must not turn a completed job run into a failure.
+            continue
+    return archived_count
 
 
 def write_json_reports(
@@ -906,10 +1243,10 @@ def write_json_reports(
             "score": item.get("score"),
             "status": item.get("status", "applied"),
             "applied_at": item.get("applied_at", ""),
+            "confirmation": item.get("confirmation"),
         }
         for url, item in sorted(history.items())
-        if item.get("status", "applied") == "applied"
-        or item.get("applied_at")
+        if history_entry_is_verified(item)
     ]
     status_counts: dict[str, int] = {}
     for row in rows:
@@ -951,8 +1288,9 @@ def write_json_reports(
             existing_items = {}
 
     # A URL in successful history is no longer an unresolved manual item.
-    for applied_url in history:
-        existing_items.pop(applied_url, None)
+    for applied_url, history_item in history.items():
+        if history_entry_is_verified(history_item):
+            existing_items.pop(applied_url, None)
 
     for url, item in existing_items.items():
         attempt = attempts.get(url)
@@ -966,13 +1304,41 @@ def write_json_reports(
                 }
             )
 
+    # Old versions could write "applied" before proving that Shine accepted
+    # the exact job. Never silently treat those records as success.
+    for url, item in history.items():
+        if history_entry_is_verified(item):
+            continue
+        existing_items[url] = {
+            "detected_at": generated_at,
+            "title": item.get("title", ""),
+            "company": item.get("company", ""),
+            "url": url,
+            "score": item.get("score"),
+            "experience": item.get("experience", ""),
+            "failure_reason": (
+                "Legacy success record has no job-specific confirmation evidence"
+            ),
+            "automation_status": "manual_only",
+            "attempt_count": attempts.get(url, {}).get("attempt_count", 0),
+            "last_attempted_at": item.get("applied_at") or generated_at,
+            "retry_after": None,
+            "screenshot": None,
+            "manual_action": (
+                "Open the exact Shine job and verify that its main button is disabled and "
+                "says Applied. If it is not, apply manually."
+            ),
+        }
+
     for row in rows:
         status = str(row.get("status", ""))
         if not status.startswith("needs_review"):
             continue
         title = str(row.get("title", ""))
-        screenshot_name = f"error-{slugify(title)[:50]}.png"
-        screenshot_path = ARTIFACT_DIR / screenshot_name
+        screenshot_path = error_screenshot_path(
+            title,
+            str(row.get("url", "")),
+        )
         existing_items[str(row.get("url", ""))] = {
             "detected_at": generated_at,
             "title": title,
@@ -994,7 +1360,7 @@ def write_json_reports(
                 "retry_after"
             ),
             "screenshot": (
-                f"artifacts/{screenshot_name}" if screenshot_path.exists() else None
+                f"artifacts/{screenshot_path.name}" if screenshot_path.exists() else None
             ),
             "manual_action": (
                 "Open the job URL, confirm it still matches your resume, sign in if needed, "
@@ -1005,9 +1371,12 @@ def write_json_reports(
     manual_jobs = sorted(
         existing_items.values(), key=lambda item: item.get("detected_at", ""), reverse=True
     )
+    archived_screenshot_count = archive_unreferenced_error_screenshots(manual_jobs)
     manual_payload = {
         "generated_at": generated_at,
         "unresolved_count": len(manual_jobs),
+        "archived_stale_screenshot_count": archived_screenshot_count,
+        "stale_screenshot_directory": "artifacts/stale-screenshots",
         "instructions": (
             "These jobs were not confirmed as applied. Review each failure_reason and URL, "
             "then apply manually only if the job is still suitable."
@@ -1024,6 +1393,46 @@ def write_json_reports(
 # ---------------------------------------------------------------------------
 
 
+def _is_expected_browser_shutdown_error(error: Exception) -> bool:
+    """Return whether Playwright is reporting an already-closed browser."""
+
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "connection closed while reading from the driver",
+            "target page, context or browser has been closed",
+            "browser has been closed",
+        )
+    )
+
+
+async def close_browser_resources(context: BrowserContext, browser: Browser) -> None:
+    """Close Playwright resources without failing when Chromium closed first.
+
+    A user can close the visible browser, or Chromium can exit after the work is
+    complete. In either case the Playwright transport may already be gone when
+    the ``finally`` block runs. Unknown cleanup errors are still raised.
+    """
+
+    cleanup_error: Exception | None = None
+    try:
+        await context.close()
+    except Exception as error:
+        if not _is_expected_browser_shutdown_error(error):
+            cleanup_error = error
+
+    try:
+        if browser.is_connected():
+            await browser.close()
+    except Exception as error:
+        if cleanup_error is None and not _is_expected_browser_shutdown_error(error):
+            cleanup_error = error
+
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
 async def run() -> None:
     load_dotenv(ROOT / ".env")
     email = os.getenv("SHINE_EMAIL", "")
@@ -1033,6 +1442,10 @@ async def run() -> None:
     tracing_enabled = env_bool("ENABLE_TRACING", False)
     max_per_run = env_int("MAX_APPLICATIONS_PER_RUN", 5)
     max_per_day = env_int("MAX_APPLICATIONS_PER_DAY", 10)
+    max_per_role_family = env_int(
+        "MAX_APPLICATIONS_PER_ROLE_FAMILY",
+        config.MAX_APPLICATIONS_PER_ROLE_FAMILY,
+    )
     max_pages = env_int("MAX_PAGES_PER_SEARCH", 2)
     search_delay_min_seconds = env_int("SEARCH_DELAY_MIN_SECONDS", 2)
     search_delay_max_seconds = env_int("SEARCH_DELAY_MAX_SECONDS", 5)
@@ -1059,8 +1472,8 @@ async def run() -> None:
     history = load_history()
     attempts = load_attempts()
     attempts_changed = False
-    for applied_url in history:
-        if attempts.pop(applied_url, None) is not None:
+    for applied_url, history_item in history.items():
+        if history_entry_is_verified(history_item) and attempts.pop(applied_url, None) is not None:
             attempts_changed = True
     if attempts_changed:
         save_attempts(attempts)
@@ -1127,17 +1540,17 @@ async def run() -> None:
                 status = detail_statuses.get(job.url, "rejected")
                 if result.accepted:
                     family = role_family(job)
-                    if job.url in history:
+                    if job.url in history and history_entry_is_verified(history[job.url]):
                         status = "already_seen"
                     elif dry_run:
                         status = "shortlisted"
                     elif applied_this_run >= application_budget:
                         status = "daily_or_run_limit"
-                    elif role_family_counts.get(family, 0) >= config.MAX_APPLICATIONS_PER_ROLE_FAMILY:
+                    elif role_family_counts.get(family, 0) >= max_per_role_family:
                         status = "role_family_limit"
                     else:
                         try:
-                            application_status = await asyncio.wait_for(
+                            application_outcome = await asyncio.wait_for(
                                 apply_to_job(
                                     page,
                                     job,
@@ -1148,6 +1561,7 @@ async def run() -> None:
                                 ),
                                 timeout=per_job_timeout_seconds,
                             )
+                            application_status = application_outcome.status
                             status = application_status
                             history[job.url] = {
                                 "title": job.title,
@@ -1159,6 +1573,7 @@ async def run() -> None:
                                 ),
                                 "score": result.score,
                                 "status": application_status,
+                                "confirmation": application_outcome.confirmation_record(),
                             }
                             save_history(history)
                             if attempts.pop(job.url, None) is not None:
@@ -1176,8 +1591,7 @@ async def run() -> None:
                             try:
                                 await asyncio.wait_for(
                                     page.screenshot(
-                                        path=ARTIFACT_DIR
-                                        / f"error-{slugify(job.title)[:50]}.png"
+                                        path=error_screenshot_path(job.title, job.url)
                                     ),
                                     timeout=5,
                                 )
@@ -1190,8 +1604,7 @@ async def run() -> None:
                             try:
                                 await asyncio.wait_for(
                                     page.screenshot(
-                                        path=ARTIFACT_DIR
-                                        / f"error-{slugify(job.title)[:50]}.png"
+                                        path=error_screenshot_path(job.title, job.url)
                                     ),
                                     timeout=5,
                                 )
@@ -1239,8 +1652,13 @@ async def run() -> None:
                 except Exception:
                     # Trace diagnostics must never hide the original run result.
                     pass
-            await context.close()
-            await browser.close()
+            try:
+                await close_browser_resources(context, browser)
+            except Exception:
+                # If the workflow already failed, preserve that original error
+                # instead of replacing it with a secondary cleanup exception.
+                if not run_failed:
+                    raise
 
     print(f"Wrote {len(rows)} evaluated jobs to {REPORT_FILE}")
     print("DRY RUN: no applications were submitted" if dry_run else "Application run complete")

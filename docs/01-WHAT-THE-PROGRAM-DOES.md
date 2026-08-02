@@ -14,9 +14,10 @@ Think of the program as a careful job-search assistant. It follows this order:
 
 ## How an application is verified
 
-The program does not assume that a click worked. It waits until Shine changes
-the main job button to a disabled **Applied** button. Only then does it record
-the job in `state/history.json`.
+The program does not assume that a click worked. For a new application it
+requires Shine's application API to return HTTP 200/201 for the same job ID,
+then reloads that exact job and requires its main button to remain disabled
+**Applied**. Only then does it record the job in `state/history.json`.
 
 If an application opens a supported card, the program clicks the card and then
 selects the option whose text matches the value in `.env`. It does not rely on
