@@ -13,6 +13,15 @@ def test_card_option_matching_uses_value_not_position():
     assert bot.choose_option_index(["15 Days", "1 Month", "2 Months"], 30, "notice period") == 1
 
 
+def test_numbered_known_application_fields_are_recognized():
+    assert bot.EXPECTED_SALARY_FIELD_PATTERN.search(
+        "1. What is your expected annual CTC?*"
+    )
+    assert bot.NOTICE_PERIOD_FIELD_PATTERN.search("2. What is your notice period?*")
+    assert bot.CURRENT_SALARY_FIELD_PATTERN.search("3) Current annual salary*")
+    assert bot.EXPERIENCE_FIELD_PATTERN.search("4. Total work experience*")
+
+
 def test_redirect_comparison_ignores_query_and_fragment_only():
     job = "https://www.shine.com/jobs/python-backend/example/123"
     assert bot._same_job_path(job, job + "?source=search#apply")

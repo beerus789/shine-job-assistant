@@ -64,6 +64,29 @@ class ApplicationAnswers:
         )
 
 
+_QUESTION_PREFIX = r"^\s*(?:\d+[.)]\s*)?"
+EXPERIENCE_FIELD_PATTERN = re.compile(
+    _QUESTION_PREFIX
+    + r"(?:total\s+)?(?:work\s+)?experience(?:\s+in\s+years)?\s*\*?$",
+    re.I,
+)
+CURRENT_SALARY_FIELD_PATTERN = re.compile(
+    _QUESTION_PREFIX
+    + r"(?:(?:what\s+is\s+your\s+)?current\s+(?:annual\s+)?(?:salary|ctc)|"
+    r"total\s+annual\s+salary).*",
+    re.I,
+)
+EXPECTED_SALARY_FIELD_PATTERN = re.compile(
+    _QUESTION_PREFIX
+    + r"(?:what\s+is\s+your\s+)?expected\s+(?:annual\s+)?(?:salary|ctc).*",
+    re.I,
+)
+NOTICE_PERIOD_FIELD_PATTERN = re.compile(
+    _QUESTION_PREFIX + r"(?:what\s+is\s+your\s+)?notice\s+period.*",
+    re.I,
+)
+
+
 def env_bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -573,6 +596,16 @@ async def _select_native_option(
 
 
 async def _field_container(label: Locator, minimum_custom_selects: int = 1) -> Locator:
+    # Shine questionnaire cards render a label in one list item and its
+    # dropdown in the immediately following list item. Resolve that pair first
+    # so a later field cannot accidentally reuse the modal's first dropdown.
+    paired_list_item = label.locator(
+        "xpath=ancestor::li[1]/following-sibling::li[1]"
+        "[.//select or .//div[contains(@class,'customSelect_customSelect')]][1]"
+    )
+    if await paired_list_item.count():
+        return paired_list_item
+
     custom_xpath = (
         "ancestor::div[count(.//div[contains(@class,'customSelect_customSelect')]) "
         f">= {minimum_custom_selects}][1]"
@@ -619,10 +652,7 @@ async def complete_known_application_fields(
 ) -> int:
     """Fill only facts supplied by the user; never infer employer answers."""
     handled = 0
-    experience_pattern = re.compile(
-        r"^(?:total\s+)?(?:work\s+)?experience(?:\s+in\s+years)?\s*\*?$", re.I
-    )
-    experience_label = await _find_field_label(scope, experience_pattern)
+    experience_label = await _find_field_label(scope, EXPERIENCE_FIELD_PATTERN)
     if experience_label is not None:
         if answers.experience_years is None or answers.experience_months is None:
             raise ManualReviewRequired(
@@ -651,23 +681,19 @@ async def complete_known_application_fields(
 
     known_fields = (
         (
-            re.compile(
-                r"^(?:(?:what\s+is\s+your\s+)?current\s+(?:annual\s+)?(?:salary|ctc)|"
-                r"total\s+annual\s+salary).*",
-                re.I,
-            ),
+            CURRENT_SALARY_FIELD_PATTERN,
             answers.current_salary_lpa,
             "CURRENT_SALARY_LPA",
             "current salary",
         ),
         (
-            re.compile(r"^(?:what\s+is\s+your\s+)?expected\s+(?:annual\s+)?(?:salary|ctc).*", re.I),
+            EXPECTED_SALARY_FIELD_PATTERN,
             answers.expected_salary_lpa,
             "EXPECTED_SALARY_LPA",
             "expected salary",
         ),
         (
-            re.compile(r"^(?:what\s+is\s+your\s+)?notice\s+period.*", re.I),
+            NOTICE_PERIOD_FIELD_PATTERN,
             answers.notice_period_days,
             "NOTICE_PERIOD_DAYS",
             "notice period",
@@ -737,7 +763,18 @@ async def _unknown_required_controls(scope: Locator) -> list[str]:
     labels = scope.locator('label:visible, legend:visible, [class*="question"]:visible')
     label_count = await labels.count()
     for index in range(label_count):
-        description = re.sub(r"\s+", " ", (await labels.nth(index).inner_text()).strip())
+        candidate = labels.nth(index)
+        tag_name = await candidate.evaluate("element => element.tagName.toLowerCase()")
+        if tag_name not in {"label", "legend"}:
+            interactive_children = candidate.locator(
+                'input, textarea, select, [role="radio"], [role="checkbox"], '
+                'div[class*="customSelect_customSelect"]'
+            )
+            if await interactive_children.count() == 0:
+                # Shine's modal heading class contains "question" even though
+                # the heading is not an application field.
+                continue
+        description = re.sub(r"\s+", " ", (await candidate.inner_text()).strip())
         if description and not known.search(description):
             details.append(description[:180])
     return list(dict.fromkeys(details))
@@ -807,6 +844,8 @@ async def apply_to_job(
         raise ManualReviewRequired(
             f"Job navigation left the Shine portal ({page.url}); the external page was not used"
         )
+    if not _same_job_path(job.url, page.url):
+        raise ManualReviewRequired(f"Job navigation redirected to {page.url}")
 
     # Shine initially renders the signed-out version of a job page and then
     # hydrates the authenticated state. Do not click until that transition is
@@ -877,11 +916,30 @@ async def apply_to_job(
 
         submit = await _visible_exact_button(
             scope,
-            ("Submit Application", "Submit", "Save & Apply", "Continue", "Next", "Apply Now"),
+            (
+                "Submit Application",
+                "Submit and apply",
+                "Submit & Apply",
+                "Submit",
+                "Save & Apply",
+                "Continue",
+                "Next",
+                "Apply Now",
+            ),
         )
         if submit is None:
             raise ManualReviewRequired("Known fields were filled, but no supported submit button was found")
         await submit.click()
+        try:
+            await applied_button.wait_for(
+                state="visible",
+                timeout=min(apply_timeout_ms, 5_000),
+            )
+            return "applied"
+        except Exception:
+            # A multi-step form may replace the modal instead of completing.
+            # Continue only after giving Shine time to expose confirmation.
+            continue
 
     raise ManualReviewRequired("Application did not finish after three form steps")
 
