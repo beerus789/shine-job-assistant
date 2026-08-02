@@ -86,6 +86,42 @@ def test_browser_cleanup_preserves_unexpected_errors():
         asyncio.run(bot.close_browser_resources(FakeContext(), FakeBrowser()))
 
 
+def test_error_screenshots_are_unique_for_jobs_with_the_same_title(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(bot, "ARTIFACT_DIR", tmp_path)
+
+    first = bot.error_screenshot_path(
+        "Python Backend Developer", "https://www.shine.com/jobs/example/1"
+    )
+    second = bot.error_screenshot_path(
+        "Python Backend Developer", "https://www.shine.com/jobs/example/2"
+    )
+
+    assert first != second
+    assert first.name.startswith("error-python-backend-developer-")
+
+
+def test_only_unreferenced_error_screenshots_are_archived(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "ARTIFACT_DIR", tmp_path)
+    current = tmp_path / "error-current-job-123.png"
+    stale = tmp_path / "error-stale-job-456.png"
+    unrelated = tmp_path / "profile.png"
+    current.write_bytes(b"current")
+    stale.write_bytes(b"stale")
+    unrelated.write_bytes(b"unrelated")
+
+    archived = bot.archive_unreferenced_error_screenshots(
+        [{"screenshot": f"artifacts/{current.name}"}]
+    )
+
+    assert archived == 1
+    assert current.exists()
+    assert not stale.exists()
+    assert (tmp_path / "stale-screenshots" / stale.name).exists()
+    assert unrelated.exists()
+
+
 def test_full_job_details_replace_misleading_card_content():
     card_job = bot.Job(
         title="Backend Engineer",

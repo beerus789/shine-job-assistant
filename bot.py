@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import json
 import os
 import random
@@ -86,6 +87,14 @@ def env_optional_int(name: str) -> int | None:
 
 def slugify(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+def error_screenshot_path(title: str, url: str) -> Path:
+    """Return a stable, collision-resistant screenshot path for one job."""
+
+    title_slug = slugify(title)[:45] or "job"
+    job_key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+    return ARTIFACT_DIR / f"error-{title_slug}-{job_key}.png"
 
 
 # ---------------------------------------------------------------------------
@@ -886,6 +895,44 @@ def write_report(rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def archive_unreferenced_error_screenshots(manual_jobs: list[dict]) -> int:
+    """Move legacy or resolved screenshots out of the active artifact folder.
+
+    Files directly under ``artifacts`` should correspond to the current manual
+    queue. Older diagnostics remain recoverable under ``stale-screenshots``.
+    """
+
+    referenced_names = {
+        Path(str(item["screenshot"])).name
+        for item in manual_jobs
+        if item.get("screenshot")
+    }
+    stale_paths = [
+        path
+        for path in ARTIFACT_DIR.glob("error-*.png")
+        if path.name not in referenced_names
+    ]
+    if not stale_paths:
+        return 0
+
+    archive_dir = ARTIFACT_DIR / "stale-screenshots"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archived_count = 0
+    for source in stale_paths:
+        destination = archive_dir / source.name
+        counter = 1
+        while destination.exists():
+            destination = archive_dir / f"{source.stem}-{counter}{source.suffix}"
+            counter += 1
+        try:
+            source.replace(destination)
+            archived_count += 1
+        except OSError:
+            # Artifact housekeeping must not turn a completed job run into a failure.
+            continue
+    return archived_count
+
+
 def write_json_reports(
     rows: list[dict],
     dry_run: bool,
@@ -971,8 +1018,10 @@ def write_json_reports(
         if not status.startswith("needs_review"):
             continue
         title = str(row.get("title", ""))
-        screenshot_name = f"error-{slugify(title)[:50]}.png"
-        screenshot_path = ARTIFACT_DIR / screenshot_name
+        screenshot_path = error_screenshot_path(
+            title,
+            str(row.get("url", "")),
+        )
         existing_items[str(row.get("url", ""))] = {
             "detected_at": generated_at,
             "title": title,
@@ -994,7 +1043,7 @@ def write_json_reports(
                 "retry_after"
             ),
             "screenshot": (
-                f"artifacts/{screenshot_name}" if screenshot_path.exists() else None
+                f"artifacts/{screenshot_path.name}" if screenshot_path.exists() else None
             ),
             "manual_action": (
                 "Open the job URL, confirm it still matches your resume, sign in if needed, "
@@ -1005,9 +1054,12 @@ def write_json_reports(
     manual_jobs = sorted(
         existing_items.values(), key=lambda item: item.get("detected_at", ""), reverse=True
     )
+    archived_screenshot_count = archive_unreferenced_error_screenshots(manual_jobs)
     manual_payload = {
         "generated_at": generated_at,
         "unresolved_count": len(manual_jobs),
+        "archived_stale_screenshot_count": archived_screenshot_count,
+        "stale_screenshot_directory": "artifacts/stale-screenshots",
         "instructions": (
             "These jobs were not confirmed as applied. Review each failure_reason and URL, "
             "then apply manually only if the job is still suitable."
@@ -1216,8 +1268,7 @@ async def run() -> None:
                             try:
                                 await asyncio.wait_for(
                                     page.screenshot(
-                                        path=ARTIFACT_DIR
-                                        / f"error-{slugify(job.title)[:50]}.png"
+                                        path=error_screenshot_path(job.title, job.url)
                                     ),
                                     timeout=5,
                                 )
@@ -1230,8 +1281,7 @@ async def run() -> None:
                             try:
                                 await asyncio.wait_for(
                                     page.screenshot(
-                                        path=ARTIFACT_DIR
-                                        / f"error-{slugify(job.title)[:50]}.png"
+                                        path=error_screenshot_path(job.title, job.url)
                                     ),
                                     timeout=5,
                                 )

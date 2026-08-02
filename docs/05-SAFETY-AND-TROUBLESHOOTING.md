@@ -58,6 +58,13 @@ after the configured cooldown; a second transient failure also becomes
 Open `artifacts/manual-review.json` and use the saved job URL to finish it
 manually. A reason and screenshot are included when possible.
 
+Every active `error-*.png` directly inside `artifacts` belongs to an entry in
+`manual-review.json`. Screenshots from older runs or jobs later confirmed as
+applied are moved to `artifacts/stale-screenshots`; they are retained only as
+diagnostics and do not represent current failures. Screenshot filenames include
+a short job identifier so listings with the same title cannot overwrite one
+another.
+
 ## Salary or experience was not selected
 
 Check the corresponding `.env` value and the failure reason in
