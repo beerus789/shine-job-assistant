@@ -1125,6 +1125,10 @@ async def run() -> None:
     tracing_enabled = env_bool("ENABLE_TRACING", False)
     max_per_run = env_int("MAX_APPLICATIONS_PER_RUN", 5)
     max_per_day = env_int("MAX_APPLICATIONS_PER_DAY", 10)
+    max_per_role_family = env_int(
+        "MAX_APPLICATIONS_PER_ROLE_FAMILY",
+        config.MAX_APPLICATIONS_PER_ROLE_FAMILY,
+    )
     max_pages = env_int("MAX_PAGES_PER_SEARCH", 2)
     search_delay_min_seconds = env_int("SEARCH_DELAY_MIN_SECONDS", 2)
     search_delay_max_seconds = env_int("SEARCH_DELAY_MAX_SECONDS", 5)
@@ -1225,7 +1229,7 @@ async def run() -> None:
                         status = "shortlisted"
                     elif applied_this_run >= application_budget:
                         status = "daily_or_run_limit"
-                    elif role_family_counts.get(family, 0) >= config.MAX_APPLICATIONS_PER_ROLE_FAMILY:
+                    elif role_family_counts.get(family, 0) >= max_per_role_family:
                         status = "role_family_limit"
                     else:
                         try:
