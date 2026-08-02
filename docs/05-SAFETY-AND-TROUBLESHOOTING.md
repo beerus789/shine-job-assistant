@@ -21,6 +21,13 @@ The same information appears in `artifacts/scored-and-applied.json`. Automation
 failures remain in `artifacts/manual-review.json` until the job URL is recorded
 in successful application history.
 
+Shine's **My Jobs → Applied** tab can briefly keep showing Recommended Jobs
+after the tab is selected. During live verification it took about five seconds
+to replace that content. The settled page exposed only the latest 20 applied
+jobs and did not show pagination controls, so older confirmed applications may
+not be visible there. Open an individual job URL and check its disabled primary
+`Applied` button when reconciling an older entry.
+
 ## Search pages load gradually
 
 The bot intentionally waits two to five seconds between search pages. This
