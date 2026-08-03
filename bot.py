@@ -30,7 +30,14 @@ from playwright.async_api import (
 )
 
 import config
-from scoring import Job, ScoreResult, parse_experience, preliminary_job_priority, score_job
+from scoring import (
+    Job,
+    ScoreResult,
+    parse_experience,
+    parse_required_experience,
+    preliminary_job_priority,
+    score_job,
+)
 
 BASE_URL = "https://www.shine.com"
 ROOT = Path(__file__).resolve().parent
@@ -390,7 +397,22 @@ def merge_job_details(
     highlights: str,
 ) -> Job:
     """Replace incomplete card fields with content from the actual job page."""
-    minimum, maximum = parse_experience(highlights)
+    highlight_minimum, highlight_maximum = parse_experience(highlights)
+    description_minimum, description_maximum = parse_required_experience(description)
+    minimum_candidates = [
+        value
+        for value in (highlight_minimum, description_minimum)
+        if value is not None
+    ]
+    minimum = max(minimum_candidates) if minimum_candidates else job.min_experience
+
+    maximum = highlight_maximum
+    if description_minimum is not None and description_minimum == minimum:
+        maximum = description_maximum
+    if maximum is not None and minimum is not None and maximum < minimum:
+        maximum = None
+    if maximum is None and description_minimum is None:
+        maximum = job.max_experience
     unique_skills = tuple(dict.fromkeys(skill.strip() for skill in detail_skills if skill.strip()))
     return Job(
         title=job.title,
@@ -398,8 +420,8 @@ def merge_job_details(
         url=job.url,
         text="\n".join(part for part in (description.strip(), highlights.strip()) if part),
         skills=unique_skills,
-        min_experience=minimum if minimum is not None else job.min_experience,
-        max_experience=maximum if maximum is not None else job.max_experience,
+        min_experience=minimum,
+        max_experience=maximum,
     )
 
 
@@ -503,6 +525,12 @@ async def score_detailed_jobs(
         else:
             reason = skipped.get(job.url, "not selected for detail scoring")
             scored.append((ScoreResult(0, False, (reason,)), job))
+            status_prefix = (
+                "pre_filtered"
+                if reason.startswith("rejected by title or experience")
+                else "not_evaluated"
+            )
+            statuses[job.url] = f"{status_prefix}: {reason}"
 
     scored.sort(key=lambda pair: pair[0].score, reverse=True)
     return scored, statuses
@@ -1440,13 +1468,13 @@ async def run() -> None:
     dry_run = env_bool("DRY_RUN", True)
     headless = env_bool("HEADLESS", False)
     tracing_enabled = env_bool("ENABLE_TRACING", False)
-    max_per_run = env_int("MAX_APPLICATIONS_PER_RUN", 5)
-    max_per_day = env_int("MAX_APPLICATIONS_PER_DAY", 10)
+    max_per_run = env_int("MAX_APPLICATIONS_PER_RUN", 20)
+    max_per_day = env_int("MAX_APPLICATIONS_PER_DAY", 20)
     max_per_role_family = env_int(
         "MAX_APPLICATIONS_PER_ROLE_FAMILY",
         config.MAX_APPLICATIONS_PER_ROLE_FAMILY,
     )
-    max_pages = env_int("MAX_PAGES_PER_SEARCH", 2)
+    max_pages = env_int("MAX_PAGES_PER_SEARCH", 3)
     search_delay_min_seconds = env_int("SEARCH_DELAY_MIN_SECONDS", 2)
     search_delay_max_seconds = env_int("SEARCH_DELAY_MAX_SECONDS", 5)
     action_delay = env_int("ACTION_DELAY_SECONDS", 3)
@@ -1455,7 +1483,7 @@ async def run() -> None:
     apply_timeout_ms = env_int("APPLY_TIMEOUT_SECONDS", 15) * 1_000
     per_job_timeout_seconds = env_int("PER_JOB_TIMEOUT_SECONDS", 45)
     detail_timeout_seconds = env_int("DETAIL_TIMEOUT_SECONDS", 20)
-    max_detail_jobs = env_int("MAX_DETAIL_JOBS_PER_RUN", 40)
+    max_detail_jobs = env_int("MAX_DETAIL_JOBS_PER_RUN", 250)
     retry_delay_hours = env_int("MANUAL_RETRY_DELAY_HOURS", 72)
     maximum_transient_attempts = env_int("MAX_TRANSIENT_ATTEMPTS", 2)
     answers = ApplicationAnswers.from_environment()

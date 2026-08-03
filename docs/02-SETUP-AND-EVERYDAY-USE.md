@@ -49,7 +49,7 @@ Change the same setting back to:
 DRY_RUN=false
 ```
 
-The next run can submit applications. The default per-run limit is three. The
+The next run can submit applications. The default per-run limit is twenty. The
 daily limit is read from `MAX_APPLICATIONS_PER_DAY` in your `.env`.
 
 ## Stop the program
@@ -67,5 +67,15 @@ Run the read-only smoke check:
 
 It checks the public login fields, search cards, job details, skills, and main
 Apply selector. It never fills credentials or clicks Apply.
+
+For a complete read-only discovery and scoring report using all configured
+pages, run:
+
+```powershell
+.\.venv\Scripts\python.exe audit_discovery.py
+```
+
+Open `artifacts/discovery-audit.json` to see every accepted, rejected, and
+`not_evaluated` job. This command does not sign in or apply.
 
 [Back to Start Here](../README.md)

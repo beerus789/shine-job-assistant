@@ -3,6 +3,7 @@ from scoring import (
     Job,
     contains_phrase,
     parse_experience,
+    parse_required_experience,
     preliminary_job_priority,
     score_job,
 )
@@ -48,6 +49,31 @@ def test_preliminary_filter_rejects_blocked_title_and_excess_experience():
     assert preliminary_job_priority(make_job(min_experience=7, max_experience=10)) is None
 
 
+def test_preliminary_filter_rejects_unrelated_search_noise():
+    assert preliminary_job_priority(
+        make_job(
+            title="Senior Accountant",
+            text="Payroll reconciliation and finance reporting",
+            skills=("Accounting",),
+        )
+    ) is None
+
+
+def test_resume_skill_density_improves_detail_priority():
+    strong_ai = make_job(
+        title="Artificial Intelligence Engineer - Python & Agentic AI",
+        text="Python backend Agentic AI LLM OpenAI APIs",
+        skills=("Python", "Agentic AI", "LLM", "OpenAI"),
+    )
+    generic = make_job(
+        title="Software Engineer II",
+        text="Python backend",
+        skills=("Python",),
+    )
+
+    assert preliminary_job_priority(strong_ai) > preliminary_job_priority(generic)
+
+
 def test_strong_match_is_accepted():
     result = score_job(make_job())
     assert result.accepted
@@ -73,6 +99,17 @@ def test_experience_over_limit_is_rejected():
 
 def test_parse_experience():
     assert parse_experience("2 to 6 Yrs") == (2, 6)
+
+
+def test_full_description_experience_patterns_are_parsed_safely():
+    assert parse_required_experience(
+        "7+ years of professional software engineering experience"
+    ) == (7, None)
+    assert parse_required_experience("Experience: 3-5 years") == (3, 5)
+    assert parse_required_experience("Experience: 35 years") == (None, None)
+    assert parse_required_experience(
+        "For more than 20 years, the company has served global clients"
+    ) == (None, None)
 
 
 def test_unrelated_sdet_role_is_rejected():
@@ -114,3 +151,16 @@ def test_role_requiring_more_than_resume_experience_is_rejected():
 def test_internship_is_rejected_for_midlevel_profile():
     result = score_job(make_job(title="Python Backend Developer Internship"))
     assert not result.accepted
+
+
+def test_misleading_ai_title_with_vlsi_description_is_rejected():
+    result = score_job(
+        make_job(
+            title="AI Agentic AI Engineer",
+            text="Python Agentic AI role purpose is to architect VLSI and hardware products",
+            skills=("Python", "Agentic AI"),
+        )
+    )
+
+    assert not result.accepted
+    assert result.reasons == ("blocked keyword: vlsi",)

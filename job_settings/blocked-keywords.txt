@@ -17,6 +17,7 @@ android
 kotlin
 firmware
 embedded
+vlsi
 network engineer
 data engineer
 devops engineer

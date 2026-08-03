@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import bot
+import audit_discovery
 import pytest
 from scoring import score_job
 
@@ -31,6 +32,46 @@ def test_daily_count_ignores_unverified_legacy_success():
     }
 
     assert bot.applications_today(history) == 1
+
+
+def test_read_only_audit_separates_accepted_and_not_evaluated_jobs():
+    accepted_job = bot.Job(
+        title="Python Backend Developer",
+        company="Accepted Co",
+        url="https://www.shine.com/jobs/backend/accepted/1",
+        text="Python FastAPI backend",
+        min_experience=2,
+        max_experience=4,
+    )
+    limited_job = bot.Job(
+        title="Backend Engineer",
+        company="Limited Co",
+        url="https://www.shine.com/jobs/backend/limited/2",
+        text="Python backend",
+    )
+    payload = audit_discovery.build_audit_payload(
+        [
+            (bot.ScoreResult(85, True, ("strong match",)), accepted_job),
+            (bot.ScoreResult(0, False, ("detail limit",)), limited_job),
+        ],
+        {limited_job.url: "not_evaluated: detail-scoring limit reached (1 jobs)"},
+        [
+            {
+                "query": "python backend",
+                "pages_visited": 3,
+                "cards_found": 60,
+                "unique_jobs_added": 2,
+            }
+        ],
+    )
+
+    assert payload["mode"] == "read_only_discovery_audit"
+    assert payload["summary"]["cards_found"] == 60
+    assert payload["summary"]["accepted"] == 1
+    assert payload["summary"]["status_counts"] == {
+        "accepted": 1,
+        "not_evaluated": 1,
+    }
 
 
 def test_numbered_known_application_fields_are_recognized():
@@ -532,6 +573,81 @@ def test_full_job_details_can_rescue_an_incomplete_card():
     )
 
     assert score_job(detailed).accepted
+
+
+def test_full_description_overrides_misleading_lower_experience_card():
+    card_job = bot.Job(
+        title="Python FastAPI Agentic AI Platforms",
+        company="Example",
+        url="https://www.shine.com/jobs/backend/example/457",
+        text="Python FastAPI 1 to 5 Yrs",
+        skills=("Python", "FastAPI"),
+        min_experience=1,
+        max_experience=5,
+    )
+    detailed = bot.merge_job_details(
+        card_job,
+        description=(
+            "We require 7+ years of professional software engineering experience "
+            "building Python FastAPI backend services."
+        ),
+        detail_skills=["Python", "FastAPI", "PostgreSQL"],
+        highlights="1 to 5 Yrs",
+    )
+
+    assert (detailed.min_experience, detailed.max_experience) == (7, None)
+    assert not score_job(detailed).accepted
+
+
+def test_detail_limit_is_reported_as_not_evaluated():
+    job = bot.Job(
+        title="Python Backend Developer",
+        company="Example",
+        url="https://www.shine.com/jobs/backend/example/458",
+        text="Python FastAPI backend 2 to 4 Yrs",
+        skills=("Python", "FastAPI"),
+        min_experience=2,
+        max_experience=4,
+    )
+
+    ranked, statuses = asyncio.run(
+        bot.score_detailed_jobs(
+            page=None,
+            jobs=[job],
+            maximum=0,
+            navigation_timeout_ms=1,
+            detail_timeout_seconds=1,
+        )
+    )
+
+    assert ranked[0][0].score == 0
+    assert statuses[job.url].startswith("not_evaluated: detail-scoring limit reached")
+
+
+def test_excess_experience_card_is_reported_as_pre_filtered():
+    job = bot.Job(
+        title="Senior Python Backend Engineer",
+        company="Example",
+        url="https://www.shine.com/jobs/backend/example/459",
+        text="Python backend 7 to 10 Yrs",
+        skills=("Python",),
+        min_experience=7,
+        max_experience=10,
+    )
+
+    _, statuses = asyncio.run(
+        bot.score_detailed_jobs(
+            page=None,
+            jobs=[job],
+            maximum=250,
+            navigation_timeout_ms=1,
+            detail_timeout_seconds=1,
+        )
+    )
+
+    assert statuses[job.url].startswith(
+        "pre_filtered: rejected by title or experience"
+    )
 
 
 def test_manual_question_is_never_retried_automatically():
