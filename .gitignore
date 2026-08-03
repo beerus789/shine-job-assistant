@@ -11,6 +11,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+tmp/
 
 # Runtime data can contain job history, URLs, and screenshots
 artifacts/

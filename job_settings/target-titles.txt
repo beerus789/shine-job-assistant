@@ -1,6 +1,9 @@
 # Titles that should be treated as similar to the desired roles.
 python backend developer
 python backend engineer
+python developer
+python engineer
+python software engineer
 backend engineer
 backend software engineer
 senior backend developer
@@ -22,4 +25,6 @@ llm application engineer
 agentic ai engineer
 applied ai engineer
 ai backend engineer
+ai engineer
+artificial intelligence engineer
 full stack python developer

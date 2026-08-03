@@ -51,8 +51,14 @@ the complete job description, detail-page skills, and experience requirement.
 
 Passing detailed jobs receive points for title similarity, required skills,
 preferred resume skills, and experience fit. A score of 60 or more is eligible.
-The bot also limits each role family to two successful applications per run so
-one type of job cannot consume the whole run.
+The bot also has a configurable per-run role-family safety cap. The supplied
+configuration uses twenty so relevant backend jobs from different companies are
+not stopped after only two successes.
+
+If the full description states a higher requirement such as `7+ years`, that
+requirement overrides a misleading lower range on the search card. Broken
+values above 15 years are ignored because Shine sometimes collapses typography
+such as `3-5` into `35` during text extraction.
 
 ## Change matching lists
 

@@ -76,12 +76,27 @@ def preliminary_job_priority(job: Job) -> int | None:
     if job.min_experience is not None and job.min_experience > config.MAX_REQUIRED_EXPERIENCE:
         return None
 
-    priority = round(_title_similarity(job.title) * 100)
-    priority += 10 * sum(
+    title_similarity = _title_similarity(job.title)
+    role_hits = sum(
+        contains_phrase(job.searchable_text, signal) for signal in config.ROLE_SIGNALS
+    )
+    # Shine's broad searches can return accountants, technicians, and other
+    # unrelated roles. Keep an incomplete but relevant card, while preventing
+    # unrelated titles from consuming the limited full-description budget.
+    if not role_hits and title_similarity < 0.58:
+        return None
+
+    required_hits = sum(
         contains_phrase(job.searchable_text, skill) for skill in config.REQUIRED_SKILLS
     )
-    if any(contains_phrase(job.searchable_text, signal) for signal in config.ROLE_SIGNALS):
-        priority += 5
+    preferred_hits = sum(
+        contains_phrase(job.searchable_text, skill) for skill in config.PREFERRED_SKILLS
+    )
+
+    priority = round(title_similarity * 100)
+    priority += 20 * required_hits
+    priority += min(36, 6 * preferred_hits)
+    priority += min(20, 4 * role_hits)
     return priority
 
 
@@ -136,6 +151,34 @@ def score_job(job: Job) -> ScoreResult:
 
 EXPERIENCE_RE = re.compile(r"(?P<minimum>\d+)\s*(?:to|-)\s*(?P<maximum>\d+)\s*Yrs", re.I)
 
+REQUIRED_EXPERIENCE_PATTERNS = (
+    re.compile(
+        r"(?:experience(?:\s+required)?|required\s+experience)\s*[:\-]\s*"
+        r"(?P<minimum>\d+)\s*(?:to|-)\s*(?P<maximum>\d+)\s*(?:years?|yrs?)",
+        re.I,
+    ),
+    re.compile(
+        r"(?P<minimum>\d+)\s*(?:to|-)\s*(?P<maximum>\d+)\s*(?:years?|yrs?)"
+        r"(?:\s+of)?(?:\s+[a-z][a-z0-9/+.-]*){0,8}\s+experience",
+        re.I,
+    ),
+    re.compile(
+        r"(?:minimum(?:\s+of)?|at\s+least)\s*(?P<minimum>\d+)\+?\s*"
+        r"(?:years?|yrs?)",
+        re.I,
+    ),
+    re.compile(
+        r"(?P<minimum>\d+)\+\s*(?:years?|yrs?)(?:\s+of)?"
+        r"(?:\s+[a-z][a-z0-9/+.-]*){0,8}\s+experience",
+        re.I,
+    ),
+    re.compile(
+        r"(?P<minimum>\d+)\s+(?:years?|yrs?)\s+of"
+        r"(?:\s+[a-z][a-z0-9/+.-]*){0,8}\s+experience",
+        re.I,
+    ),
+)
+
 
 def parse_experience(text: str) -> tuple[int | None, int | None]:
     """Extract a Shine experience range such as ``2 to 6 Yrs``."""
@@ -145,3 +188,29 @@ def parse_experience(text: str) -> tuple[int | None, int | None]:
         value = int(single.group(1)) if single else None
         return value, value
     return int(match.group("minimum")), int(match.group("maximum"))
+
+
+def parse_required_experience(text: str) -> tuple[int | None, int | None]:
+    """Extract explicit experience requirements from a full description.
+
+    Shine's summary range can disagree with wording such as ``7+ years of
+    professional software engineering experience`` in the description. Values
+    above 15 are ignored because broken typography can collapse ``3-5`` into
+    ``35`` and a company's age is not a candidate requirement.
+    """
+
+    requirements: list[tuple[int, int | None]] = []
+    for pattern in REQUIRED_EXPERIENCE_PATTERNS:
+        for match in pattern.finditer(text):
+            minimum = int(match.group("minimum"))
+            maximum_text = match.groupdict().get("maximum")
+            maximum = int(maximum_text) if maximum_text else None
+            if minimum > 15 or (maximum is not None and maximum > 15):
+                continue
+            if maximum is not None and maximum < minimum:
+                continue
+            requirements.append((minimum, maximum))
+
+    if not requirements:
+        return None, None
+    return max(requirements, key=lambda item: item[0])

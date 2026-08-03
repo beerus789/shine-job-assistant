@@ -21,6 +21,15 @@ Each scored job shows:
 - `reasons`: how the score or rejection was decided.
 - `url`: the Shine job page.
 
+`not_evaluated` means the job was discovered but its full page was outside the
+configured detail-page budget. It is not the same as a scoring rejection. Raise
+`MAX_DETAIL_JOBS_PER_RUN` if suitable-looking jobs repeatedly receive this
+status.
+
+`pre_filtered` means the search card clearly showed a blocked title or a
+minimum experience requirement above the configured limit, so opening the full
+page would not have changed the safe decision.
+
 Each new application-history entry also has a `confirmation` object. A newly
 submitted job is recorded only when Shine returns HTTP 200/201 for the same job
 ID and the current job's disabled `Applied` button remains after a fresh reload.

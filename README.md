@@ -75,6 +75,7 @@ Generated reports and history stay local and are excluded from Git.
 4. [Settings explained](docs/04-SETTINGS-EXPLAINED.md)
 5. [Safety and troubleshooting](docs/05-SAFETY-AND-TROUBLESHOOTING.md)
 6. [Understanding the JSON reports](docs/06-UNDERSTANDING-JSON-REPORTS.md)
+7. [Discovery audit - 4 August 2026](docs/07-DISCOVERY-AUDIT-2026-08-04.md)
 
 ## Tests
 
@@ -91,3 +92,12 @@ For a read-only check against Shine's current public page structure:
 ```
 
 The smoke test does not enter credentials or click Apply.
+
+For a thorough read-only run across every configured search page and selected
+full job description:
+
+```powershell
+.\.venv\Scripts\python.exe audit_discovery.py
+```
+
+This creates `artifacts/discovery-audit.json` without signing in or applying.

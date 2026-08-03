@@ -3,7 +3,8 @@
 Think of the program as a careful job-search assistant. It follows this order:
 
 1. Signs in to Shine using the information stored in `.env`.
-2. Searches using Python-backend and GenAI-specific phrases.
+2. Searches using Python-backend and GenAI-specific phrases, checking three
+   result pages for every phrase by default.
 3. Uses search cards only to prioritize likely candidates.
 4. Opens selected Shine job pages and reads their full description, skills, and
    experience requirement.

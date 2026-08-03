@@ -44,7 +44,7 @@ ROLE_SIGNALS = _load_terms("role-signals.txt")
 CANDIDATE_YEARS_EXPERIENCE = 4
 MAX_REQUIRED_EXPERIENCE = 4
 MINIMUM_SCORE = 60
-MAX_APPLICATIONS_PER_ROLE_FAMILY = 2
+MAX_APPLICATIONS_PER_ROLE_FAMILY = 20
 
 
 # Scoring weights add to 100. A blocked keyword or missing required skill
