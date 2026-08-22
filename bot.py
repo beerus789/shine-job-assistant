@@ -26,6 +26,7 @@ from playwright.async_api import (
     Locator,
     Page,
     Response,
+    TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
 
@@ -373,11 +374,18 @@ async def discover(
                 delay_ms = random.randint(delay_min_seconds, delay_max_seconds) * 1_000
                 await page.wait_for_timeout(delay_ms)
             suffix = "" if page_number == 1 else f"-{page_number}"
-            await page.goto(
-                f"{BASE_URL}/job-search/{base_slug}{suffix}",
-                wait_until="domcontentloaded",
-                timeout=navigation_timeout_ms,
-            )
+            target_url = f"{BASE_URL}/job-search/{base_slug}{suffix}"
+            try:
+                await page.goto(
+                    target_url,
+                    wait_until="domcontentloaded",
+                    timeout=navigation_timeout_ms,
+                )
+            except PlaywrightTimeoutError:
+                metric["navigation_timeouts"] = metric.get("navigation_timeouts", 0) + 1
+                if not page.url.startswith(target_url):
+                    navigation_count += 1
+                    continue
             navigation_count += 1
             page_jobs = await extract_jobs(page)
             unique_before = len(discovered)
