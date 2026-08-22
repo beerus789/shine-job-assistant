@@ -1,4 +1,7 @@
+import asyncio
+
 import config
+import bot
 from scoring import (
     Job,
     contains_phrase,
@@ -7,6 +10,39 @@ from scoring import (
     preliminary_job_priority,
     score_job,
 )
+
+
+def test_discovery_skips_timed_out_page_and_continues(monkeypatch):
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+            self.visited = []
+
+        async def goto(self, url, **kwargs):
+            self.visited.append(url)
+            if "first-query" in url:
+                self.url = "about:blank"
+                raise bot.PlaywrightTimeoutError("slow navigation")
+            self.url = url
+
+        async def wait_for_timeout(self, delay_ms):
+            return None
+
+    async def fake_extract_jobs(page):
+        return [make_job(url=page.url)]
+
+    monkeypatch.setattr(bot, "extract_jobs", fake_extract_jobs)
+    monkeypatch.setattr(config, "SEARCH_QUERIES", ["first query", "second query"])
+    page = FakePage()
+
+    jobs, metrics = asyncio.run(bot.discover(page, 1, 1_000, 0, 0))
+
+    assert [job.url for job in jobs] == [
+        "https://www.shine.com/job-search/second-query-jobs"
+    ]
+    assert metrics[0]["navigation_timeouts"] == 1
+    assert metrics[0]["pages_visited"] == 0
+    assert metrics[1]["pages_visited"] == 1
 
 
 def test_human_editable_settings_are_loaded():
