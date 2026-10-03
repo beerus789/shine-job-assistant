@@ -1,0 +1,5 @@
+# These phrases are strong disqualifiers when found anywhere in the job text.
+php only
+.net only
+java only
+unpaid internship

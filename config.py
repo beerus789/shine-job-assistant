@@ -36,6 +36,7 @@ SEARCH_QUERIES = _load_terms("search-queries.txt")
 REQUIRED_SKILLS = _load_terms("required-skills.txt")
 PREFERRED_SKILLS = _load_terms("preferred-skills.txt")
 BLOCKED_KEYWORDS = _load_terms("blocked-keywords.txt")
+BLOCKED_DESCRIPTION_KEYWORDS = _load_terms("blocked-description-keywords.txt")
 ROLE_SIGNALS = _load_terms("role-signals.txt")
 
 

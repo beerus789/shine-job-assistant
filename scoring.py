@@ -27,11 +27,25 @@ def contains_phrase(text: str, phrase: str) -> bool:
         return False
 
     pattern = (
-        r"(?<![a-z0-9+#.])"
+        # A period can be punctuation after a phrase ("Java only.") and must
+        # count as a boundary. Letters, digits, plus, and hash remain attached
+        # to technology identifiers (so "java" won't match "javascript").
+        r"(?<![a-z0-9+#])"
         + r"\s+".join(phrase_tokens)
-        + r"(?![a-z0-9+#.])"
+        + r"(?![a-z0-9+#])"
     )
     return re.search(pattern, normalize(text)) is not None
+
+
+def has_early_applicant_badge(text: str) -> bool:
+    """Recognize Shine's visible badge without treating prose as a badge.
+
+    Card text preserves the badge as its own line. Matching the complete label
+    avoids interpreting wording such as "we encourage early applicants" as a
+    priority signal. The badge affects ordering only, never job eligibility.
+    """
+    labels = {"early applicant", "be an early applicant"}
+    return any(" ".join(line.split()).casefold() in labels for line in text.splitlines())
 
 
 @dataclass(frozen=True)
@@ -43,6 +57,7 @@ class Job:
     skills: tuple[str, ...] = ()
     min_experience: int | None = None
     max_experience: int | None = None
+    is_early_applicant: bool = False
 
     @property
     def searchable_text(self) -> str:
@@ -57,23 +72,64 @@ class ScoreResult:
 
 
 def _title_similarity(title: str) -> float:
+    return _best_title_match(title)[1]
+
+
+def _best_title_match(title: str) -> tuple[str, float]:
+    """Return a stable closest configured title and its similarity score."""
     actual = normalize(title)
     return max(
-        SequenceMatcher(None, actual, normalize(target)).ratio()
-        for target in config.TARGET_TITLES
+        (
+            (target, SequenceMatcher(None, actual, normalize(target)).ratio())
+            for target in sorted(config.TARGET_TITLES)
+        ),
+        key=lambda item: (item[1], item[0]),
     )
+
+
+def preliminary_job_rejection_reason(job: Job) -> str | None:
+    """Explain why a search card was excluded before its description was read.
+
+    This is an inexpensive candidate filter only. Its reasons are deliberately
+    recorded in reports so borderline matches can be reviewed and the lists or
+    threshold adjusted with evidence.
+    """
+    blocked_title = sorted(
+        keyword for keyword in config.BLOCKED_KEYWORDS
+        if contains_phrase(job.title, keyword)
+    )
+    if blocked_title:
+        return f"blocked title phrase: {', '.join(blocked_title)}"
+
+    if job.min_experience is not None and job.min_experience > config.MAX_REQUIRED_EXPERIENCE:
+        return (
+            f"card minimum experience {job.min_experience} years exceeds configured "
+            f"maximum {config.MAX_REQUIRED_EXPERIENCE} years"
+        )
+
+    title_target, title_similarity = _best_title_match(job.title)
+    role_hits = sorted(
+        signal for signal in config.ROLE_SIGNALS
+        if contains_phrase(job.searchable_text, signal)
+    )
+    if not role_hits and title_similarity < 0.58:
+        return (
+            "no backend/AI role signal on search card and title similarity "
+            f"{title_similarity:.2f} is below 0.58 "
+            f"(closest configured title: {title_target!r})"
+        )
+    return None
 
 
 def preliminary_job_priority(job: Job) -> int | None:
     """Rank safe detail-page candidates without making a final decision.
 
     Search cards are incomplete, so missing skills never reject a job here.
-    Only an unsuitable title or an excessive minimum-experience requirement is
-    considered strong enough to avoid the extra detail-page request.
+    Explicit blocked titles and excessive minimum experience are strong enough
+    to skip. A low title similarity also skips when the card has no backend or
+    applied-AI role signal. Every skip receives a specific report reason.
     """
-    if any(contains_phrase(job.title, keyword) for keyword in config.BLOCKED_KEYWORDS):
-        return None
-    if job.min_experience is not None and job.min_experience > config.MAX_REQUIRED_EXPERIENCE:
+    if preliminary_job_rejection_reason(job) is not None:
         return None
 
     title_similarity = _title_similarity(job.title)
@@ -83,9 +139,6 @@ def preliminary_job_priority(job: Job) -> int | None:
     # Shine's broad searches can return accountants, technicians, and other
     # unrelated roles. Keep an incomplete but relevant card, while preventing
     # unrelated titles from consuming the limited full-description budget.
-    if not role_hits and title_similarity < 0.58:
-        return None
-
     required_hits = sum(
         contains_phrase(job.searchable_text, skill) for skill in config.REQUIRED_SKILLS
     )
@@ -105,9 +158,23 @@ def score_job(job: Job) -> ScoreResult:
     corpus = normalize(job.searchable_text)
     reasons: list[str] = []
 
-    blocked = sorted(k for k in config.BLOCKED_KEYWORDS if contains_phrase(corpus, k))
-    if blocked:
-        return ScoreResult(0, False, (f"blocked keyword: {', '.join(blocked)}",))
+    blocked_title = sorted(
+        keyword for keyword in config.BLOCKED_KEYWORDS
+        if contains_phrase(job.title, keyword)
+    )
+    blocked_description = sorted(
+        keyword for keyword in config.BLOCKED_DESCRIPTION_KEYWORDS
+        if contains_phrase(corpus, keyword)
+    )
+    if blocked_title or blocked_description:
+        reasons = []
+        if blocked_title:
+            reasons.append(f"blocked title keyword: {', '.join(blocked_title)}")
+        if blocked_description:
+            reasons.append(
+                f"blocked description phrase: {', '.join(blocked_description)}"
+            )
+        return ScoreResult(0, False, tuple(reasons))
 
     missing = sorted(k for k in config.REQUIRED_SKILLS if not contains_phrase(corpus, k))
     if missing:
@@ -200,7 +267,11 @@ def parse_required_experience(text: str) -> tuple[int | None, int | None]:
     """
 
     requirements: list[tuple[int, int | None]] = []
-    for pattern in REQUIRED_EXPERIENCE_PATTERNS:
+    range_spans: list[tuple[int, int]] = []
+    # Parse ranges first. A phrase such as "3-6 years of experience" also
+    # matches the later single-value pattern at its upper endpoint (6); that
+    # endpoint must not be reinterpreted as a separate minimum requirement.
+    for pattern in REQUIRED_EXPERIENCE_PATTERNS[:2]:
         for match in pattern.finditer(text):
             minimum = int(match.group("minimum"))
             maximum_text = match.groupdict().get("maximum")
@@ -210,6 +281,19 @@ def parse_required_experience(text: str) -> tuple[int | None, int | None]:
             if maximum is not None and maximum < minimum:
                 continue
             requirements.append((minimum, maximum))
+            range_spans.append(match.span())
+
+    for pattern in REQUIRED_EXPERIENCE_PATTERNS[2:]:
+        for match in pattern.finditer(text):
+            if any(
+                match.start() < range_end and match.end() > range_start
+                for range_start, range_end in range_spans
+            ):
+                continue
+            minimum = int(match.group("minimum"))
+            if minimum > 15:
+                continue
+            requirements.append((minimum, None))
 
     if not requirements:
         return None, None
