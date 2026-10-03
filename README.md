@@ -11,6 +11,10 @@ limits. Every result is recorded for auditing.
   after a fresh reload.
 - Search cards only prioritize candidates; the full Shine job page is loaded
   and scored before any application is attempted.
+- Shine's **Be An Early Applicant** badge affects priority. It never makes an
+  unsuitable job eligible or adds points to its match score.
+- When a detail-page limit leaves jobs unchecked, later runs give unchecked
+  jobs their turn before revisiting recently checked jobs.
 - External websites are never used. External redirects or tabs go directly to
   the manual-review queue.
 - Unknown questions, unsupported controls, and missing truthful answers are not
@@ -50,6 +54,7 @@ Add or remove one line to change a rule:
 - `required-skills.txt`
 - `preferred-skills.txt`
 - `blocked-keywords.txt`
+- `blocked-description-keywords.txt`
 - `target-titles.txt`
 - `search-queries.txt`
 - `role-signals.txt`
@@ -58,12 +63,18 @@ Blank lines and lines beginning with `#` are ignored.
 
 ## Reports
 
-- `artifacts/latest.csv`: latest evaluated jobs.
+- `artifacts/latest.csv`: only jobs without a confirmed application in the most
+  recent run, with the reason and recommended next step. It resets each run.
 - `artifacts/scored-and-applied.json`: scores and confirmed application history.
 - `artifacts/manual-review.json`: unresolved redirects, questions, timeouts, or
   unsupported forms.
 - `state/history.json`: local duplicate protection.
 - `state/attempts.json`: retry cooldowns and manual-only jobs.
+- `artifacts/run-status.json`: whether the run completed, has missing detail
+  coverage, or encountered failures.
+- `artifacts/search-diagnostics.json`: search-page results and failures.
+- `state/detail-progress.json`: when candidate details were last checked, used
+  to share the detail-page budget across runs.
 
 Generated reports and history stay local and are excluded from Git.
 
@@ -76,6 +87,8 @@ Generated reports and history stay local and are excluded from Git.
 5. [Safety and troubleshooting](docs/05-SAFETY-AND-TROUBLESHOOTING.md)
 6. [Understanding the JSON reports](docs/06-UNDERSTANDING-JSON-REPORTS.md)
 7. [Discovery audit - 4 August 2026](docs/07-DISCOVERY-AUDIT-2026-08-04.md)
+8. [September diagnostic fixes](docs/08-SEPTEMBER-DIAGNOSTIC-FIXES.md)
+9. [Tech-lead code review](docs/09-TECH-LEAD-CODE-REVIEW.md)
 
 ## Tests
 
