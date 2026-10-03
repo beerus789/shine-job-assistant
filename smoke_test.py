@@ -20,11 +20,19 @@ from bot import (
     extract_job_detail,
     extract_jobs,
     slugify,
+    single_instance_run_lock,
+    wait_for_search_results,
 )
 from scoring import preliminary_job_priority
+from bot import select_detail_candidates
 
 
 async def run_smoke_test() -> None:
+    with single_instance_run_lock(ROOT / "state" / "bot-run.lock"):
+        await _run_smoke_test_locked()
+
+
+async def _run_smoke_test_locked() -> None:
     load_dotenv(ROOT / ".env")
     timeout_ms = int(os.getenv("NAVIGATION_TIMEOUT_SECONDS", "30")) * 1_000
     query = os.getenv("SMOKE_TEST_QUERY", "python backend developer").strip().lower()
@@ -41,6 +49,7 @@ async def run_smoke_test() -> None:
                 wait_until="domcontentloaded",
                 timeout=timeout_ms,
             )
+            await wait_for_search_results(page, timeout_ms)
             jobs = await extract_jobs(page)
             if not jobs:
                 raise RuntimeError("Search-card extraction returned no jobs")
@@ -50,7 +59,9 @@ async def run_smoke_test() -> None:
             ]
             if not candidates:
                 raise RuntimeError("Search page returned no detail candidates")
-            candidate = max(candidates, key=lambda job: preliminary_job_priority(job) or 0)
+            ordered, _ = select_detail_candidates(candidates, len(candidates))
+            candidate = ordered[0]
+            early_applicant_count = sum(job.is_early_applicant for job in jobs)
             detailed = await extract_job_detail(page, candidate, timeout_ms)
             if len(detailed.text) < 100:
                 raise RuntimeError("Job-description extraction returned too little text")
@@ -83,7 +94,8 @@ async def run_smoke_test() -> None:
             print(
                 "Smoke test passed: "
                 f"{len(jobs)} cards, {len(detailed.text)} detail characters, "
-                f"{len(detailed.skills)} skills"
+                f"{len(detailed.skills)} skills, "
+                f"{early_applicant_count} Early Applicant badge(s)"
             )
         finally:
             await context.close()

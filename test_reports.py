@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import json
 import threading
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,7 @@ def test_card_option_matching_uses_value_not_position():
     assert bot.choose_option_index(["15 Days", "1 Month", "2 Months"], 30, "notice period") == 1
 
 
-def test_daily_count_ignores_unverified_legacy_success():
+def test_daily_count_conservatively_includes_unverified_legacy_success():
     today = datetime.now().astimezone().isoformat()
     history = {
         "verified": {
@@ -31,7 +32,215 @@ def test_daily_count_ignores_unverified_legacy_success():
         "legacy": {"status": "applied", "applied_at": today},
     }
 
-    assert bot.applications_today(history) == 1
+    assert bot.applications_today(history) == 2
+
+
+def test_exhausted_daily_limit_is_reported_without_starting_browser(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    artifact_dir = tmp_path / "artifacts"
+    monkeypatch.setattr(bot, "STATE_DIR", state_dir)
+    monkeypatch.setattr(bot, "ATTEMPTS_FILE", state_dir / "attempts.json")
+    monkeypatch.setattr(bot, "HISTORY_FILE", state_dir / "history.json")
+    monkeypatch.setattr(bot, "ARTIFACT_DIR", artifact_dir)
+    monkeypatch.setattr(bot, "REPORT_FILE", artifact_dir / "latest.csv")
+    monkeypatch.setattr(bot, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "load_history", lambda: {
+        "https://www.shine.com/jobs/python/example/1": {
+            "status": "applied",
+            "applied_at": datetime.now().astimezone().isoformat(),
+        }
+    })
+    monkeypatch.setattr(bot, "load_attempts", lambda: {})
+    monkeypatch.setattr(bot, "async_playwright", lambda: pytest.fail("browser must not start"))
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("SHINE_EMAIL", "person@example.com")
+    monkeypatch.setenv("SHINE_PASSWORD", "not-a-real-password")
+    monkeypatch.setenv("MAX_APPLICATIONS_PER_RUN", "20")
+    monkeypatch.setenv("MAX_APPLICATIONS_PER_DAY", "1")
+
+    asyncio.run(bot.run())
+
+    status = json.loads((artifact_dir / "run-status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "limit_reached"
+    assert status["phase"] == "preflight_limits"
+    assert status["application_limits"]["blocking_status"] == "daily_limit"
+    assert status["application_limits"]["applications_today_at_start"] == 1
+    assert (artifact_dir / "latest.csv").is_file()
+
+
+def test_legacy_applied_history_is_held_for_manual_verification():
+    assert bot.history_entry_hold_status({"status": "applied"}) == (
+        "manual_review_pending",
+        "legacy application record has no confirmation; verify before retrying",
+    )
+    assert bot.history_entry_hold_status({"status": "rejected"}) is None
+
+
+def test_boolean_environment_values_fail_closed_on_typos(monkeypatch):
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    assert bot.env_bool("DRY_RUN", True) is True
+    monkeypatch.setenv("DRY_RUN", "false")
+    assert bot.env_bool("DRY_RUN", True) is False
+    monkeypatch.setenv("DRY_RUN", "treu")
+    with pytest.raises(RuntimeError, match="DRY_RUN must be true/false"):
+        bot.env_bool("DRY_RUN", True)
+
+
+def test_latest_csv_is_reset_and_contains_only_unapplied_jobs(tmp_path, monkeypatch):
+    report_path = tmp_path / "latest.csv"
+    report_path.write_text("stale previous run", encoding="utf-8")
+    monkeypatch.setattr(bot, "ARTIFACT_DIR", tmp_path)
+    monkeypatch.setattr(bot, "REPORT_FILE", report_path)
+
+    assert bot.write_report([]) == 0
+    with report_path.open(encoding="utf-8", newline="") as stream:
+        assert list(csv.DictReader(stream)) == []
+
+    rows = [
+        {
+            "score": 85,
+            "accepted": True,
+            "status": "applied",
+            "title": "Python Backend Engineer",
+            "company": "Applied Co",
+            "experience": "3-6",
+            "url": "https://example.test/applied",
+            "reasons": "strong match",
+            "detail_evaluated": True,
+            "is_early_applicant": False,
+        },
+        {
+            "score": 82,
+            "accepted": True,
+            "status": "already_applied",
+            "title": "Django Developer",
+            "company": "Previously Applied Co",
+            "experience": "3-6",
+            "url": "https://example.test/already-applied",
+            "reasons": "strong match",
+            "detail_evaluated": True,
+            "is_early_applicant": False,
+        },
+        {
+            "score": 81,
+            "accepted": True,
+            "status": "already_seen",
+            "title": "FastAPI Developer",
+            "company": "Already Seen Co",
+            "experience": "3-6",
+            "url": "https://example.test/already-seen",
+            "reasons": "verified application in history",
+            "detail_evaluated": False,
+            "is_early_applicant": False,
+        },
+        {
+            "score": 35,
+            "accepted": False,
+            "status": "rejected",
+            "title": "Java Engineer",
+            "company": "Rejected Co",
+            "experience": "3-6",
+            "url": "https://example.test/rejected",
+            "reasons": "required skill missing: python",
+            "detail_evaluated": True,
+            "is_early_applicant": False,
+        },
+        {
+            "score": 80,
+            "accepted": True,
+            "status": "needs_review: screening questions",
+            "title": "RAG Engineer",
+            "company": "Review Co",
+            "experience": "3-5",
+            "url": "https://example.test/review",
+            "reasons": "strong match",
+            "detail_evaluated": True,
+            "is_early_applicant": True,
+        },
+        {
+            "score": 82,
+            "accepted": True,
+            "status": "shortlisted",
+            "title": "Django Developer",
+            "company": "Preview Co",
+            "experience": "3-5",
+            "url": "https://example.test/preview",
+            "reasons": "strong match",
+            "detail_evaluated": True,
+            "is_early_applicant": False,
+        },
+    ]
+
+    assert bot.write_report(rows) == 3
+    with report_path.open(encoding="utf-8", newline="") as stream:
+        report_rows = list(csv.DictReader(stream))
+
+    assert [row["company"] for row in report_rows] == [
+        "Rejected Co",
+        "Review Co",
+        "Preview Co",
+    ]
+    assert "required skill missing: python" in report_rows[0]["reason_not_applied"]
+    assert "matching reasons" in report_rows[0]["recommended_action"]
+    assert report_rows[1]["reason_not_applied"] == "screening questions"
+    assert "manual-review.json" in report_rows[1]["recommended_action"]
+    assert "Dry-run preview only" in report_rows[2]["reason_not_applied"]
+
+
+def test_latest_csv_explains_precise_application_caps_and_prefilter_rules(tmp_path, monkeypatch):
+    report_path = tmp_path / "latest.csv"
+    monkeypatch.setattr(bot, "ARTIFACT_DIR", tmp_path)
+    monkeypatch.setattr(bot, "REPORT_FILE", report_path)
+    rows = [
+        {
+            "score": 82, "accepted": True,
+            "status": "run_limit: per-run limit (20) reached",
+            "title": "Python Backend Engineer", "company": "Run Cap Co",
+            "experience": "3-5", "url": "https://example.test/run-cap",
+            "reasons": "strong match", "detail_evaluated": True,
+        },
+        {
+            "score": 82, "accepted": True,
+            "status": "daily_limit: daily limit (100) reached",
+            "title": "Python Backend Engineer", "company": "Daily Cap Co",
+            "experience": "3-5", "url": "https://example.test/day-cap",
+            "reasons": "strong match", "detail_evaluated": True,
+        },
+        {
+            "score": 0, "accepted": False,
+            "status": "pre_filtered: blocked title phrase: data engineer",
+            "title": "Python Data Engineer", "company": "Skipped Co",
+            "experience": "3-5", "url": "https://example.test/skipped",
+            "reasons": "blocked title phrase: data engineer", "detail_evaluated": False,
+        },
+    ]
+
+    assert bot.write_report(rows) == 3
+    with report_path.open(encoding="utf-8", newline="") as stream:
+        report_rows = list(csv.DictReader(stream))
+
+    assert "per-run limit (20) reached" in report_rows[0]["reason_not_applied"]
+    assert "daily limit (100) reached" in report_rows[1]["reason_not_applied"]
+    assert "blocked title phrase: data engineer" in report_rows[2]["reason_not_applied"]
+    assert "full description was not read" in report_rows[2]["recommended_action"]
+
+
+def test_run_state_lock_rejects_a_second_process_owner(tmp_path):
+    lock = tmp_path / "bot-run.lock"
+    with bot.single_instance_run_lock(lock):
+        with pytest.raises(RuntimeError, match="Another Shine automation process"):
+            with bot.single_instance_run_lock(lock):
+                pass
+
+
+def test_atomic_json_write_replaces_file_with_complete_document(tmp_path):
+    destination = tmp_path / "state.json"
+    bot.atomic_write_json(destination, {"complete": True, "count": 3})
+    assert json.loads(destination.read_text(encoding="utf-8")) == {
+        "complete": True,
+        "count": 3,
+    }
+    assert list(tmp_path.iterdir()) == [destination]
 
 
 def test_read_only_audit_separates_accepted_and_not_evaluated_jobs():
@@ -68,6 +277,8 @@ def test_read_only_audit_separates_accepted_and_not_evaluated_jobs():
     assert payload["mode"] == "read_only_discovery_audit"
     assert payload["summary"]["cards_found"] == 60
     assert payload["summary"]["accepted"] == 1
+    assert payload["summary"]["evaluated_in_this_run"] == 1
+    assert payload["status"] == "incomplete"
     assert payload["summary"]["status_counts"] == {
         "accepted": 1,
         "not_evaluated": 1,
@@ -162,6 +373,10 @@ def _run_fake_shine_application(
     redirect_after_success=False,
     popup_after_persisted_reload=False,
     questionnaire=False,
+    questionnaire_delay_ms=0,
+    response_delay_ms=0,
+    apply_timeout_ms=5_000,
+    job_url_suffix="",
     answers=None,
 ):
     state = {"applied": False, "request_count": 0, "last_payload": None}
@@ -179,7 +394,7 @@ def _run_fake_shine_application(
                 self.end_headers()
                 self.wfile.write(html)
                 return
-            if self.path != "/jobs/backend/example/123":
+            if self.path.split("?", 1)[0] != "/jobs/backend/example/123":
                 self.send_error(404)
                 return
             persisted_behavior = ""
@@ -253,7 +468,9 @@ def _run_fake_shine_application(
                   {persisted_behavior}
                   <script>
                     function openQuestionnaire() {{
-                      document.getElementById('applicationDialog').style.display = 'block';
+                      setTimeout(() => {{
+                        document.getElementById('applicationDialog').style.display = 'block';
+                      }}, {questionnaire_delay_ms});
                     }}
                     function openSelect(header) {{
                       header.parentElement.querySelectorAll('.customSelect_option')
@@ -311,6 +528,8 @@ def _run_fake_shine_application(
             request_payload = json.loads(self.rfile.read(length) or b"{}")
             state["request_count"] += 1
             state["last_payload"] = request_payload
+            if response_delay_ms:
+                threading.Event().wait(response_delay_ms / 1_000)
             if response_status in {200, 201} and persist_after_success:
                 state["applied"] = True
             response_payload = json.dumps(
@@ -329,7 +548,7 @@ def _run_fake_shine_application(
     job = bot.Job(
         title="Backend Engineer",
         company="Example",
-        url=f"http://127.0.0.1:{server.server_port}/jobs/backend/example/123",
+        url=f"http://127.0.0.1:{server.server_port}/jobs/backend/example/123{job_url_suffix}",
         text="Python backend",
     )
 
@@ -344,7 +563,7 @@ def _run_fake_shine_application(
                     job,
                     navigation_timeout_ms=5_000,
                     authentication_timeout_ms=5_000,
-                    apply_timeout_ms=5_000,
+                    apply_timeout_ms=apply_timeout_ms,
                     answers=answers
                     or bot.ApplicationAnswers(None, None, None, None, None),
                 )
@@ -422,6 +641,46 @@ def test_apply_to_job_completes_supported_questionnaire_once(monkeypatch):
         "years": "4 yrs",
         "months": "6 months",
     }
+
+
+def test_apply_to_job_waits_for_a_delayed_questionnaire(monkeypatch):
+    outcome, state = _run_fake_shine_application(
+        monkeypatch,
+        201,
+        questionnaire=True,
+        questionnaire_delay_ms=1_200,
+        answers=bot.ApplicationAnswers(4, 6, 18, 22, 30),
+    )
+
+    assert outcome.status == "applied"
+    assert state["request_count"] == 1
+    assert state["last_payload"]["expected"] == "20-25 LPA"
+
+
+def test_apply_to_job_does_not_resubmit_a_pending_questionnaire(monkeypatch):
+    outcome, state = _run_fake_shine_application(
+        monkeypatch,
+        201,
+        questionnaire=True,
+        response_delay_ms=6_000,
+        apply_timeout_ms=10_000,
+        answers=bot.ApplicationAnswers(4, 6, 18, 22, 30),
+    )
+
+    assert outcome.status == "applied"
+    assert state["request_count"] == 1
+
+
+def test_apply_to_job_ignores_query_and_fragment_when_matching_job_id(monkeypatch):
+    outcome, state = _run_fake_shine_application(
+        monkeypatch,
+        201,
+        job_url_suffix="?source=search#apply",
+    )
+
+    assert outcome.job_id == "123"
+    assert state["last_payload"] == {"job_id": "123"}
+    assert state["request_count"] == 1
 
 
 def test_redirect_comparison_ignores_query_and_fragment_only():
@@ -646,7 +905,7 @@ def test_excess_experience_card_is_reported_as_pre_filtered():
     )
 
     assert statuses[job.url].startswith(
-        "pre_filtered: rejected by title or experience"
+        "pre_filtered: card minimum experience 7 years"
     )
 
 
@@ -726,6 +985,8 @@ def test_json_reports_separate_scored_and_manual_jobs(tmp_path, monkeypatch):
             "experience": "3-6",
             "url": "https://example.test/job/1",
             "reasons": "strong match",
+            "detail_evaluated": True,
+            "is_early_applicant": True,
         },
         {
             "score": 80,
@@ -786,6 +1047,9 @@ def test_json_reports_separate_scored_and_manual_jobs(tmp_path, monkeypatch):
     scored = json.loads(scored_path.read_text(encoding="utf-8"))
     manual = json.loads(manual_path.read_text(encoding="utf-8"))
     assert scored["summary"]["evaluated_in_this_run"] == 2
+    assert scored["summary"]["discovered_in_this_run"] == 12
+    assert scored["summary"]["early_applicant_evaluated_in_this_run"] == 1
+    assert scored["status"] == "partial_failure"
     assert scored["summary"]["applied_jobs_in_history"] == 2
     assert len(scored["scored_jobs"]) == 2
     applied_confirmation = next(
@@ -800,3 +1064,103 @@ def test_json_reports_separate_scored_and_manual_jobs(tmp_path, monkeypatch):
         "screening questions",
         "Legacy success record has no job-specific confirmation evidence",
     }
+
+
+def test_run_records_uncertain_application_before_stopping_on_browser_close(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    job = bot.Job(
+        title="Python Backend Engineer",
+        company="Example",
+        url="https://www.shine.com/jobs/backend/example/321",
+        text="Python backend",
+    )
+    state_dir = tmp_path / "state"
+    artifact_dir = tmp_path / "artifacts"
+    monkeypatch.setattr(bot, "STATE_DIR", state_dir)
+    monkeypatch.setattr(bot, "HISTORY_FILE", state_dir / "history.json")
+    monkeypatch.setattr(bot, "ATTEMPTS_FILE", state_dir / "attempts.json")
+    monkeypatch.setattr(bot, "ARTIFACT_DIR", artifact_dir)
+    monkeypatch.setattr(bot, "REPORT_FILE", artifact_dir / "latest.csv")
+    monkeypatch.setattr(bot, "SCORED_AND_APPLIED_FILE", artifact_dir / "scored.json")
+    monkeypatch.setattr(bot, "MANUAL_REVIEW_FILE", artifact_dir / "manual-review.json")
+    monkeypatch.setattr(bot, "load_dotenv", lambda *args, **kwargs: None)
+    async def fake_discover(*args, **kwargs):
+        return [job], [{"unique_jobs_added": 1, "pages": [{"status": "ready"}]}]
+
+    async def fake_score(*args, **kwargs):
+        return [(bot.ScoreResult(80, True, ("eligible",)), job)], {}
+
+    async def fake_apply(page, *args, **kwargs):
+        page.context.browser.connected = False
+        raise RuntimeError("browser disconnected during confirmation")
+
+    class FakePage:
+        def __init__(self, context):
+            self.context = context
+
+        def is_closed(self):
+            return False
+
+        async def screenshot(self, **kwargs):
+            return None
+
+    class FakeContext:
+        def __init__(self, browser):
+            self.browser = browser
+
+        async def new_page(self):
+            return FakePage(self)
+
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        connected = True
+
+        async def new_context(self):
+            return FakeContext(self)
+
+        def is_connected(self):
+            return self.connected
+
+    class FakePlaywright:
+        async def __aenter__(self):
+            self.browser = FakeBrowser()
+            self.chromium = SimpleNamespace(launch=self.launch)
+            return self
+
+        async def launch(self, **kwargs):
+            return self.browser
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(bot, "async_playwright", FakePlaywright)
+    monkeypatch.setattr(bot, "login", lambda *args, **kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(bot, "discover", fake_discover)
+    monkeypatch.setattr(bot, "score_detailed_jobs", fake_score)
+    monkeypatch.setattr(bot, "apply_to_job", fake_apply)
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("HEADLESS", "true")
+    monkeypatch.setenv("ENABLE_TRACING", "false")
+    monkeypatch.setenv("SHINE_EMAIL", "test@example.com")
+    monkeypatch.setenv("SHINE_PASSWORD", "test-password")
+    monkeypatch.setenv("MAX_APPLICATIONS_PER_RUN", "1")
+    monkeypatch.setenv("MAX_APPLICATIONS_PER_DAY", "1")
+    monkeypatch.setenv("MAX_DETAIL_JOBS_PER_RUN", "1")
+
+    with pytest.raises(RuntimeError, match="Browser session closed"):
+        asyncio.run(bot.run())
+
+    report = json.loads((artifact_dir / "scored.json").read_text(encoding="utf-8"))
+    manual = json.loads((artifact_dir / "manual-review.json").read_text(encoding="utf-8"))
+    status = json.loads((artifact_dir / "run-status.json").read_text(encoding="utf-8"))
+    assert report["scored_jobs"][0]["status"].startswith("needs_review:")
+    assert report["scored_jobs"][0]["accepted"] is True
+    assert manual["jobs"][0]["automation_status"] == "manual_only"
+    assert "outcome unconfirmed" in manual["jobs"][0]["failure_reason"]
+    assert status["status"] == "failed"
+    assert not (state_dir / "history.json").exists()

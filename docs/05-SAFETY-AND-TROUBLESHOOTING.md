@@ -1,25 +1,69 @@
 # Safety and Troubleshooting
 
-## "Daily application limit reached"
+## "Application run not started: ... limit reached"
 
-Nothing is wrong. The number of confirmed applications recorded today reached
-`MAX_APPLICATIONS_PER_DAY`. The program stops before opening the browser and can
-run again on the next calendar day.
+The message names the exact cap: the per-run limit, the daily limit, or both.
+If a cap is already exhausted at startup, the program writes the reason and
+current counts to `artifacts/run-status.json` and does not open a browser.
+Otherwise, suitable jobs after a cap is reached are listed in `latest.csv`
+with a precise limit status.
 
 ## The browser changes many URLs but applies to nothing
 
-Open `artifacts/latest.csv` and inspect the `status` column:
+Open `artifacts/latest.csv`. It is reset at the beginning of each run and only
+lists jobs without a confirmed application. Successful `applied`,
+`already_applied`, and `already_seen` outcomes are omitted. For each remaining
+job, `reason_not_applied` describes the issue and `recommended_action` gives a
+next step. Common statuses mean:
 
 - `rejected`: the job failed the matching rules.
+- `pre_filtered`: the search card failed the preliminary title or experience
+  or role-signal checks; the full description was not read. `reasons` explains
+  the exact title phrase, experience cap, or weak title match.
+- `not_evaluated`: the detail-page limit left this job unchecked in this run.
 - `shortlisted`: dry-run mode found a suitable job but did not apply.
-- `already_seen`: the URL is already in local application history.
-- `role_family_limit`: enough jobs of that type were already applied in the run.
+- `run_limit`: the per-launch cap stopped further applications.
+- `daily_limit`: the daily cap stopped further applications.
+- `both_application_limits`: both global caps were reached at the same point.
+- `role_family_limit`: the per-role-family cap stopped further applications.
+- `retry_cooldown`: an earlier temporary failure is waiting for its retry time.
+- `manual_review_pending`: a person must verify or complete the job first.
 - `needs_review`: the page changed, redirected, timed out, or needs attention.
-- `applied`: Shine displayed the confirmed Applied state.
+
+For `rejected`, review the `reasons` column and the job description; change your
+matching rules only if the role truly fits. For `pre_filtered`, the full
+description was not opened, so adjust preliminary title/experience rules only
+if they are excluding suitable jobs. For `not_evaluated`, let a later run check
+the job or increase `MAX_DETAIL_JOBS_PER_RUN`. For `shortlisted`, the run was a
+preview; no application was sent. For a limit status, review the named cap in
+`.env`; the daily cap resets on the next local calendar day, while the per-run
+cap resets on a new launch. For `needs_review`, open
+`artifacts/manual-review.json`, inspect any screenshot, then verify or finish
+the application manually. Do not retry an outcome that might already have been
+submitted until you verify its state on Shine.
 
 The same information appears in `artifacts/scored-and-applied.json`. Automation
 failures remain in `artifacts/manual-review.json` until the job URL is recorded
 in successful application history.
+
+Check `artifacts/run-status.json` before concluding that every job was checked:
+
+- `complete`: the run finished with no detected search, detail, or application
+  failures and no candidates left outside the detail budget. Application caps
+  can still prevent otherwise suitable jobs from being applied to.
+- `running`: the process is in the saved phase and has not written its final
+  outcome yet.
+- `incomplete`: the detail-page cap left candidates unchecked. The next run
+  prioritizes those jobs if they still appear in search results.
+- `partial_failure`: at least one search page, detail check, or application
+  failed. The summary can also show unchecked jobs when both issues occur.
+- `failed`: a fatal error stopped the run; the saved phase and error identify
+  where it stopped.
+
+Use `artifacts/search-diagnostics.json` for page failures and
+`artifacts/manual-review.json` for jobs needing attention. A full-description
+failure is not a confirmed application failure: no Apply step occurred for
+that job.
 
 Shine's **My Jobs → Applied** tab can briefly keep showing Recommended Jobs
 after the tab is selected. During live verification it took about five seconds
@@ -33,6 +77,20 @@ not be visible there. Open an individual job URL and check its disabled primary
 The bot intentionally waits two to five seconds between search pages. This
 reduces burst traffic and gives each page time to settle. The delay does not
 apply before the first search page.
+
+## Only some suitable-looking jobs were checked
+
+Look at `not_evaluated_in_this_run` in the main JSON summary. The detail limit
+is intentional, and a later run rotates toward previously unchecked candidates.
+The Early Applicant badge raises priority among candidates with equal check
+history, but it cannot bypass experience or skill rules. Missing a skill on a
+short search card alone does not reject a job; the full description is checked
+when that candidate gets its turn.
+
+Rotation covers jobs rediscovered in the current searches. It does not revisit
+listings that have disappeared from search results or guarantee a fixed number
+of applications. A low score, cooldown, manual-only hold, verified history, or
+application cap can still prevent an application.
 
 ## A job redirects outside Shine
 

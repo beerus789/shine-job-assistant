@@ -1,11 +1,7 @@
-# A matching phrase rejects the job immediately.
+# Role/title phrases reject a job only when they appear in its title.
 technical support
 desktop support
 sales executive
-php only
-.net only
-java only
-unpaid internship
 internship
 trainee
 fresher

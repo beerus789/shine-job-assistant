@@ -10,14 +10,17 @@ from __future__ import annotations
 import asyncio
 import csv
 import hashlib
+import io
 import json
 import os
 import random
 import re
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
+from contextlib import contextmanager
 
 from dotenv import load_dotenv
 from playwright.async_api import (
@@ -31,12 +34,18 @@ from playwright.async_api import (
 )
 
 import config
+from detail_progress import DetailProgress
+from run_reporting import application_limit_status, build_run_summary, final_run_status
 from scoring import (
     Job,
     ScoreResult,
+    has_early_applicant_badge,
+    contains_phrase,
+    normalize,
     parse_experience,
     parse_required_experience,
     preliminary_job_priority,
+    preliminary_job_rejection_reason,
     score_job,
 )
 
@@ -49,6 +58,7 @@ ATTEMPTS_FILE = STATE_DIR / "attempts.json"
 REPORT_FILE = ARTIFACT_DIR / "latest.csv"
 SCORED_AND_APPLIED_FILE = ARTIFACT_DIR / "scored-and-applied.json"
 MANUAL_REVIEW_FILE = ARTIFACT_DIR / "manual-review.json"
+SEARCH_CARD_SELECTOR = 'article[itemprop="itemListElement"], article[class*="result-card_card__"], div.jdbigCard'
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +68,17 @@ MANUAL_REVIEW_FILE = ARTIFACT_DIR / "manual-review.json"
 
 class ManualReviewRequired(RuntimeError):
     """A job needs a truthful answer or a website flow the bot does not know."""
+
+
+class DiscoveryError(RuntimeError):
+    """A search failed to expose reliable results; it was not an empty search."""
+
+
+def require_open_browser(page: Page) -> None:
+    """A dead session is a run failure, not a failure of every remaining job."""
+    browser = page.context.browser
+    if page.is_closed() or (browser is not None and not browser.is_connected()):
+        raise RuntimeError("Browser session closed; run stopped before attempting more jobs")
 
 
 @dataclass(frozen=True)
@@ -124,7 +145,79 @@ NOTICE_PERIOD_FIELD_PATTERN = re.compile(
 
 
 def env_bool(name: str, default: bool) -> bool:
-    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be true/false, yes/no, on/off, or 1/0")
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write a same-directory temporary file, then atomically replace the target."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def atomic_write_json(path: Path, payload: object) -> None:
+    atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+
+
+@contextmanager
+def single_instance_run_lock(path: Path):
+    """Prevent concurrent runs from racing duplicate and daily-limit state."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError) as exc:
+            raise RuntimeError(
+                "Another Shine automation process is already using the workspace state"
+            ) from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def env_int(name: str, default: int) -> int:
@@ -168,8 +261,7 @@ def load_history() -> dict[str, dict]:
 
 
 def save_history(history: dict[str, dict]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    HISTORY_FILE.write_text(json.dumps(history, indent=2, sort_keys=True), encoding="utf-8")
+    atomic_write_json(HISTORY_FILE, history)
 
 
 def load_attempts() -> dict[str, dict]:
@@ -179,10 +271,7 @@ def load_attempts() -> dict[str, dict]:
 
 
 def save_attempts(attempts: dict[str, dict]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    ATTEMPTS_FILE.write_text(
-        json.dumps(attempts, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    atomic_write_json(ATTEMPTS_FILE, attempts)
 
 
 def history_entry_is_verified(item: dict) -> bool:
@@ -197,6 +286,20 @@ def history_entry_is_verified(item: dict) -> bool:
         str(confirmation.get(field, "")).strip()
         for field in ("method", "job_id", "verified_at")
     )
+
+
+def history_entry_hold_status(item: dict | None) -> tuple[str, str] | None:
+    """Hold legacy apparent successes until a human verifies the Shine state."""
+    if not item:
+        return None
+    if history_entry_is_verified(item):
+        return "already_seen", "verified application already exists in history"
+    if item.get("status") in {"applied", "already_applied"}:
+        return (
+            "manual_review_pending",
+            "legacy application record has no confirmation; verify before retrying",
+        )
+    return None
 
 
 def failure_is_transient(reason: str) -> bool:
@@ -272,7 +375,9 @@ def applications_today(history: dict[str, dict]) -> int:
     return sum(
         1
         for item in history.values()
-        if history_entry_is_verified(item)
+        # Count unverified legacy successes conservatively for the daily cap:
+        # they are held for human review, but may still be real submissions.
+        if item.get("status") in {"applied", "already_applied"}
         and item.get("applied_at", "").startswith(today)
     )
 
@@ -306,11 +411,17 @@ async def login(page: Page, email: str, password: str, navigation_timeout_ms: in
     await page.get_by_role("button", name="Log In", exact=True).click()
     # Waiting for the current page's load state returns immediately because the
     # login page is already loaded. Wait for Shine's actual redirect instead.
-    await page.wait_for_url(
-        "**/dashboard",
-        wait_until="domcontentloaded",
-        timeout=navigation_timeout_ms,
-    )
+    try:
+        await page.wait_for_url(
+            "**/dashboard",
+            wait_until="domcontentloaded",
+            timeout=navigation_timeout_ms,
+        )
+    except PlaywrightTimeoutError as exc:
+        text = (await page.locator("body").inner_text()).lower()
+        if "captcha" in text or "one time password" in text or "enter otp" in text:
+            raise RuntimeError("Shine requires CAPTCHA/OTP. Complete verification manually.") from exc
+        raise RuntimeError("Login did not reach the dashboard. Check credentials or finish verification manually.") from exc
 
     page_text = (await page.locator("body").inner_text()).lower()
     if "captcha" in page_text or "one time password" in page_text or "enter otp" in page_text:
@@ -319,25 +430,65 @@ async def login(page: Page, email: str, password: str, navigation_timeout_ms: in
         raise RuntimeError("Login did not complete. Check credentials or finish any verification manually.")
 
 
+async def wait_for_search_results(page: Page, timeout_ms: int) -> str:
+    """Wait for hydrated cards or a real empty result, never just DOMContentLoaded."""
+    try:
+        state = await page.wait_for_function(
+            r"""selector => {
+              const visible = e => e.getClientRects().length > 0;
+              const cards = [...document.querySelectorAll(selector)].filter(visible);
+              const ready = cards.filter(e => !e.closest('[inert], [aria-busy="true"]')
+                && !e.className.includes('is-placeholder'));
+              const text = document.body?.innerText || '';
+              if (/verify (?:you are|you're) human|access denied|unusual traffic|complete the captcha/i.test(text)) return 'blocked';
+              if (ready.some(e => e.querySelector('a[href*="/jobs/"]'))) return 'ready';
+              if (!cards.length && /\b0 jobs found\b|\bno jobs found\b|\bno jobs match(?:ed|ing)?\b/i.test(text)) return 'empty';
+              return false;
+            }""",
+            arg=SEARCH_CARD_SELECTOR,
+            timeout=timeout_ms,
+        )
+    except PlaywrightTimeoutError as exc:
+        raise DiscoveryError(
+            "Search results did not become ready; layout changed or loading stalled"
+        ) from exc
+    result = await state.json_value()
+    await state.dispose()
+    if result == "blocked":
+        raise DiscoveryError("Shine blocked the search or requires human verification")
+    return result
+
+
 async def extract_jobs(page: Page) -> list[Job]:
-    cards = await page.locator("div.jdbigCard").evaluate_all(
-        """cards => cards.slice(0, 30).map(card => {
+    """Read legacy and redesigned Shine cards; links may have no visible text."""
+    cards = await page.locator(SEARCH_CARD_SELECTOR).evaluate_all(
+        """cards => cards.filter(card => card.getClientRects().length > 0
+          && !card.closest('[inert], [aria-busy="true"]')
+          && !card.className.includes('is-placeholder')).map(card => {
           const link = card.querySelector('a[href*="/jobs/"]');
-          const title = link?.textContent?.trim() || '';
-          const company = card.querySelector('.jdTruncationCompany, [class*="CompanyName"], [class*="companyName"]')?.textContent?.trim() || '';
-          const skills = [...card.querySelectorAll('li')].map(x => x.textContent.trim()).filter(Boolean);
-          return {title, company, url: link?.href || '', text: card.innerText || '', skills};
+          const title = card.querySelector('[itemprop="name"], h2, h3')?.textContent?.trim() || link?.textContent?.trim() || '';
+          const company = card.querySelector('[class*="result-card_company__"], .jdTruncationCompany, [class*="CompanyName"], [class*="companyName"]')?.textContent?.trim() || '';
+          const skills = [...card.querySelectorAll('[class*="result-card_skills-item__"], li')]
+            .map(x => x.textContent.replace(/^[\\s·]+/, '').trim()).filter(Boolean);
+          const earlyLabels = new Set(['early applicant', 'be an early applicant']);
+          const earlyApplicant = [...card.querySelectorAll('span, p, div, li, [class*="badge"], [class*="chip"]')]
+            .some(element => earlyLabels.has((element.innerText || element.textContent || '')
+              .replaceAll(String.fromCharCode(160), ' ').trim().toLowerCase()
+              .split(' ').filter(Boolean).join(' ')));
+          return {title, company, url: link?.href || '', text: card.innerText || '', skills, earlyApplicant};
         }).filter(x => x.title && x.url)"""
     )
-    jobs: list[Job] = []
+    jobs: dict[str, Job] = {}
     for card in cards:
         resolved_url = urljoin(BASE_URL, card["url"])
         # Search results must never introduce an off-site application URL.
-        if not _is_shine_url(resolved_url):
+        parsed = urlsplit(resolved_url)
+        if not _is_shine_url(resolved_url) or not re.fullmatch(r"/jobs/.+/\d+/?", parsed.path):
             continue
+        # Tracking parameters and fragments must not create duplicate applications.
+        resolved_url = parsed._replace(path=parsed.path.rstrip("/"), query="", fragment="").geturl()
         minimum, maximum = parse_experience(card["text"])
-        jobs.append(
-            Job(
+        jobs[resolved_url] = Job(
                 title=card["title"],
                 company=card["company"],
                 url=resolved_url,
@@ -345,9 +496,12 @@ async def extract_jobs(page: Page) -> list[Job]:
                 skills=tuple(card["skills"]),
                 min_experience=minimum,
                 max_experience=maximum,
-            )
+                is_early_applicant=(
+                    card["earlyApplicant"] or has_early_applicant_badge(card["text"])
+                    or (resolved_url in jobs and jobs[resolved_url].is_early_applicant)
+                ),
         )
-    return jobs
+    return list(jobs.values())
 
 
 async def discover(
@@ -367,34 +521,75 @@ async def discover(
             "pages_visited": 0,
             "cards_found": 0,
             "unique_jobs_added": 0,
+            "pages": [],
         }
         base_slug = f"{slugify(query)}-jobs"
+        previous_page_urls: set[str] | None = None
         for page_number in range(1, max_pages + 1):
+            require_open_browser(page)
             if navigation_count:
                 delay_ms = random.randint(delay_min_seconds, delay_max_seconds) * 1_000
                 await page.wait_for_timeout(delay_ms)
             suffix = "" if page_number == 1 else f"-{page_number}"
             target_url = f"{BASE_URL}/job-search/{base_slug}{suffix}"
-            try:
-                await page.goto(
-                    target_url,
-                    wait_until="domcontentloaded",
-                    timeout=navigation_timeout_ms,
-                )
-            except PlaywrightTimeoutError:
-                metric["navigation_timeouts"] = metric.get("navigation_timeouts", 0) + 1
-                if not page.url.startswith(target_url):
-                    navigation_count += 1
-                    continue
+            page_metric = {"page": page_number, "url": target_url}
+            metric["pages"].append(page_metric)
+            metric["pages_visited"] += 1
             navigation_count += 1
-            page_jobs = await extract_jobs(page)
+            try:
+                started = asyncio.get_running_loop().time()
+                try:
+                    response = await page.goto(
+                        target_url,
+                        wait_until="domcontentloaded",
+                        timeout=navigation_timeout_ms,
+                    )
+                    if response is not None and response.status >= 400:
+                        raise DiscoveryError(f"Search returned HTTP {response.status}")
+                except PlaywrightTimeoutError:
+                    metric["navigation_timeouts"] = metric.get("navigation_timeouts", 0) + 1
+                    if not _same_job_path(target_url, page.url):
+                        raise DiscoveryError("Search navigation timed out before reaching its destination")
+                if not _same_job_path(target_url, page.url):
+                    raise DiscoveryError(f"Search redirected to {page.url}")
+                state = await wait_for_search_results(page, navigation_timeout_ms)
+                page_jobs = await extract_jobs(page) if state == "ready" else []
+                if state == "ready" and not page_jobs:
+                    raise DiscoveryError("Cards are visible but no valid Shine job links could be extracted")
+                page_urls = {job.url for job in page_jobs}
+                if page_urls and page_urls == previous_page_urls:
+                    raise DiscoveryError("Pagination repeated the previous page; stopping this search")
+                previous_page_urls = page_urls
+                page_metric.update(status=state, cards_found=len(page_jobs), seconds=round(asyncio.get_running_loop().time() - started, 2))
+            except Exception as exc:
+                require_open_browser(page)
+                page_metric.update(status="failed", error=str(exc).strip() or type(exc).__name__)
+                print(f"Search failed: {query}, page {page_number}: {page_metric['error']}", flush=True)
+                break
             unique_before = len(discovered)
             for job in page_jobs:
+                previous = discovered.get(job.url)
+                if previous is not None and previous.is_early_applicant:
+                    job = replace(job, is_early_applicant=True)
                 discovered[job.url] = job
-            metric["pages_visited"] += 1
             metric["cards_found"] += len(page_jobs)
             metric["unique_jobs_added"] += len(discovered) - unique_before
+            print(f"Search: {query}, page {page_number}: {len(page_jobs)} jobs ({len(discovered) - unique_before} new)", flush=True)
+            if state == "empty":
+                break
         search_metrics.append(metric)
+    failed_pages = sum(p["status"] == "failed" for m in search_metrics for p in m["pages"])
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    diagnostic_path = ARTIFACT_DIR / "search-diagnostics.json"
+    atomic_write_json(diagnostic_path, {
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "status": "partial_failure" if discovered and failed_pages else "failed" if failed_pages else "complete",
+        "unique_jobs": len(discovered),
+        "failed_pages": failed_pages,
+        "search_metrics": search_metrics,
+    })
+    if not discovered and failed_pages:
+        raise DiscoveryError(f"Job discovery failed; see {diagnostic_path}. Previous job reports were preserved.")
     return list(discovered.values()), search_metrics
 
 
@@ -407,20 +602,25 @@ def merge_job_details(
     """Replace incomplete card fields with content from the actual job page."""
     highlight_minimum, highlight_maximum = parse_experience(highlights)
     description_minimum, description_maximum = parse_required_experience(description)
-    minimum_candidates = [
-        value
-        for value in (highlight_minimum, description_minimum)
-        if value is not None
-    ]
-    minimum = max(minimum_candidates) if minimum_candidates else job.min_experience
-
-    maximum = highlight_maximum
-    if description_minimum is not None and description_minimum == minimum:
+    # A complete range in the full description is more informative than a
+    # compact card value such as "6 Yrs". A single minimum ("6+ years") is
+    # different: keep the stricter of it and the card's stated minimum.
+    if description_minimum is not None and description_maximum is not None:
+        minimum = description_minimum
         maximum = description_maximum
+    else:
+        minimum_candidates = [
+            value for value in (highlight_minimum, description_minimum)
+            if value is not None
+        ]
+        minimum = max(minimum_candidates) if minimum_candidates else job.min_experience
+        maximum = highlight_maximum
+        if description_minimum is not None and description_minimum == minimum:
+            maximum = description_maximum
+        if maximum is None and description_minimum is None:
+            maximum = job.max_experience
     if maximum is not None and minimum is not None and maximum < minimum:
         maximum = None
-    if maximum is None and description_minimum is None:
-        maximum = job.max_experience
     unique_skills = tuple(dict.fromkeys(skill.strip() for skill in detail_skills if skill.strip()))
     return Job(
         title=job.title,
@@ -430,6 +630,7 @@ def merge_job_details(
         skills=unique_skills,
         min_experience=minimum,
         max_experience=maximum,
+        is_early_applicant=job.is_early_applicant,
     )
 
 
@@ -476,19 +677,32 @@ async def extract_job_detail(
 
 
 def select_detail_candidates(
-    jobs: list[Job], maximum: int
+    jobs: list[Job], maximum: int, *, previous_checks: dict[str, float] | None = None,
 ) -> tuple[list[Job], dict[str, str]]:
-    """Select the strongest safe card candidates for mandatory detail scoring."""
+    """Reach unseen candidates before revisiting recently checked descriptions.
+
+    Within the same coverage group, prefer Early Applicant cards and then fit.
+    The badge never exempts a job from title/experience or final scoring rules.
+    """
+    if maximum < 0:
+        raise ValueError("Detail limit cannot be negative")
+    previous_checks = previous_checks or {}
     ranked_candidates: list[tuple[int, Job]] = []
     skipped: dict[str, str] = {}
     for job in jobs:
+        rejection_reason = preliminary_job_rejection_reason(job)
         priority = preliminary_job_priority(job)
-        if priority is None:
-            skipped[job.url] = "rejected by title or experience before detail scoring"
+        if rejection_reason is not None or priority is None:
+            skipped[job.url] = rejection_reason or "preliminary rules excluded this card"
         else:
             ranked_candidates.append((priority, job))
 
-    ranked_candidates.sort(key=lambda pair: pair[0], reverse=True)
+    ranked_candidates.sort(key=lambda pair: (
+        previous_checks.get(pair[1].url, 0),
+        not pair[1].is_early_applicant,
+        -pair[0],
+        pair[1].url,
+    ))
     selected = [job for _, job in ranked_candidates[:maximum]]
     for _, job in ranked_candidates[maximum:]:
         skipped[job.url] = f"detail-scoring limit reached ({maximum} jobs)"
@@ -501,13 +715,17 @@ async def score_detailed_jobs(
     maximum: int,
     navigation_timeout_ms: int,
     detail_timeout_seconds: int,
+    *,
+    previous_checks: dict[str, float] | None = None,
 ) -> tuple[list[tuple[ScoreResult, Job]], dict[str, str]]:
     """Score only enriched jobs and surface detail failures for manual review."""
-    selected, skipped = select_detail_candidates(jobs, maximum)
+    selected, skipped = select_detail_candidates(jobs, maximum, previous_checks=previous_checks)
     enriched: dict[str, Job] = {}
     failures: dict[str, str] = {}
 
-    for job in selected:
+    for index, job in enumerate(selected, 1):
+        require_open_browser(page)
+        started = asyncio.get_running_loop().time()
         try:
             enriched[job.url] = await asyncio.wait_for(
                 extract_job_detail(page, job, navigation_timeout_ms),
@@ -518,7 +736,11 @@ async def score_detailed_jobs(
                 f"job-detail extraction exceeded {detail_timeout_seconds} seconds"
             )
         except Exception as exc:
+            require_open_browser(page)
             failures[job.url] = f"job-detail extraction failed: {str(exc).strip() or type(exc).__name__}"
+        elapsed = asyncio.get_running_loop().time() - started
+        outcome = "needs review" if job.url in failures else "read"
+        print(f"Details {index}/{len(selected)}: {outcome} in {elapsed:.1f}s — {job.title}", flush=True)
 
     scored: list[tuple[ScoreResult, Job]] = []
     statuses: dict[str, str] = {}
@@ -535,26 +757,36 @@ async def score_detailed_jobs(
             scored.append((ScoreResult(0, False, (reason,)), job))
             status_prefix = (
                 "pre_filtered"
-                if reason.startswith("rejected by title or experience")
+                if preliminary_job_rejection_reason(job) is not None
                 else "not_evaluated"
             )
             statuses[job.url] = f"{status_prefix}: {reason}"
 
-    scored.sort(key=lambda pair: pair[0].score, reverse=True)
+    scored.sort(key=lambda pair: (
+        pair[0].accepted, pair[0].accepted and pair[1].is_early_applicant, pair[0].score,
+    ), reverse=True)
     return scored, statuses
 
 
 def role_family(job: Job) -> str:
-    text = job.searchable_text.lower()
-    if any(term in text for term in ("genai", "generative ai", "rag", "llm", "langchain", "agentic ai")):
-        return "genai_rag"
-    if "software development engineer" in text or re.search(r"\bsde\s*(?:2|3|ii|iii)\b", text):
+    # Classify from the title, not the entire description: incidental mentions
+    # in a long posting must not consume a different role family's quota.
+    title = normalize(job.title)
+    if re.search(
+        r"\bsoftware development engineer\b|\bsde\s*(?:1|2|3|i|ii|iii)\b",
+        title,
+    ):
         return "sde"
-    if any(term in text for term in ("fastapi", "django", "flask")):
+    if any(
+        contains_phrase(title, term)
+        for term in ("genai", "generative ai", "rag", "llm", "langchain", "agentic ai")
+    ):
+        return "genai_rag"
+    if any(contains_phrase(title, term) for term in ("fastapi", "django", "flask")):
         return "framework_backend"
-    if "backend" in text or "back end" in text:
+    if contains_phrase(title, "backend") or contains_phrase(title, "back end"):
         return "backend"
-    if "software engineer" in text:
+    if contains_phrase(title, "software engineer"):
         return "software_engineering"
     return "other"
 
@@ -790,6 +1022,20 @@ async def complete_known_application_fields(
     return handled
 
 
+def _is_supported_application_field_label(value: str) -> bool:
+    """Match only labels the bot can safely fill from explicit user facts."""
+    label = re.sub(r"\s+", " ", value).strip()
+    return any(
+        pattern.fullmatch(label)
+        for pattern in (
+            EXPERIENCE_FIELD_PATTERN,
+            CURRENT_SALARY_FIELD_PATTERN,
+            EXPECTED_SALARY_FIELD_PATTERN,
+            NOTICE_PERIOD_FIELD_PATTERN,
+        )
+    )
+
+
 async def _application_scope(page: Page) -> Locator | None:
     candidates = page.locator(
         '[role="dialog"]:visible, form:visible, div[class*="modal"]:visible, '
@@ -823,7 +1069,6 @@ async def _unknown_required_controls(scope: Locator) -> list[str]:
     )
     details: list[str] = []
     count = await controls.count()
-    known = re.compile(r"salary|ctc|experience|notice\s*period", re.I)
     for index in range(count):
         control = controls.nth(index)
         if not await control.is_visible() or await control.is_disabled():
@@ -833,12 +1078,12 @@ async def _unknown_required_controls(scope: Locator) -> list[str]:
               const id = element.id;
               const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
               const container = element.closest('label, [class*="question"], [class*="field"]');
-              return [label?.innerText, element.getAttribute('aria-label'),
-                      element.getAttribute('placeholder'), container?.innerText]
-                .filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim().slice(0, 180);
+              return (label?.innerText || element.getAttribute('aria-label') ||
+                      element.getAttribute('placeholder') || container?.innerText || '')
+                .replace(/\\s+/g, ' ').trim().slice(0, 180);
             }"""
         )
-        if not known.search(description or ""):
+        if not _is_supported_application_field_label(description or ""):
             details.append(description or "unlabelled required control")
 
     # Custom question cards do not always use input elements. Treat any other
@@ -858,7 +1103,10 @@ async def _unknown_required_controls(scope: Locator) -> list[str]:
                 # the heading is not an application field.
                 continue
         description = re.sub(r"\s+", " ", (await candidate.inner_text()).strip())
-        if description and not known.search(description):
+        if description and not any(
+            _is_supported_application_field_label(line)
+            for line in description.splitlines()
+        ):
             details.append(description[:180])
     return list(dict.fromkeys(details))
 
@@ -1043,7 +1291,7 @@ async def apply_to_job(
         state="visible", timeout=authentication_timeout_ms
     )
 
-    job_id = job.url.rstrip("/").rsplit("/", 1)[-1]
+    job_id = urlsplit(job.url).path.rstrip("/").rsplit("/", 1)[-1]
     if await _current_job_is_applied(page):
         return ApplicationOutcome(
             status="already_applied",
@@ -1135,9 +1383,10 @@ async def apply_to_job(
     page.context.on("page", observe_application_page)
     try:
         await button.click()
+        deadline = asyncio.get_running_loop().time() + apply_timeout_ms / 1_000
+        submitted_forms: set[tuple[str, ...]] = set()
 
-        for _ in range(3):
-            await page.wait_for_timeout(500)
+        while asyncio.get_running_loop().time() < deadline:
             # Check the origin before reading or clicking anything on the result page.
             await require_safe_application_destination()
 
@@ -1159,14 +1408,30 @@ async def apply_to_job(
 
             scope = await _application_scope(page)
             if scope is None:
-                response = await _wait_for_application_response(
-                    response_future, apply_timeout_ms
-                )
-                if response is not None:
-                    return await confirmed_outcome(response)
-                raise ManualReviewRequired(
-                    "No matching Shine application response and no supported form appeared"
-                )
+                # A questionnaire may arrive after an asynchronous profile/API
+                # check. Keep watching for it as well as the submission response.
+                await page.wait_for_timeout(200)
+                continue
+
+            # Track question labels rather than selected values or validation
+            # messages: an unchanged form must never be submitted twice while
+            # its original request is still pending.
+            question_labels: list[str] = []
+            for pattern in (
+                EXPERIENCE_FIELD_PATTERN,
+                CURRENT_SALARY_FIELD_PATTERN,
+                EXPECTED_SALARY_FIELD_PATTERN,
+                NOTICE_PERIOD_FIELD_PATTERN,
+            ):
+                label = await _find_field_label(scope, pattern)
+                if label is not None:
+                    question_labels.append(
+                        re.sub(r"\s+", " ", (await label.inner_text()).strip().lower())
+                    )
+            form_key = tuple(question_labels)
+            if form_key in submitted_forms:
+                await page.wait_for_timeout(200)
+                continue
 
             handled = await complete_known_application_fields(page, scope, answers)
             unknown_controls = await _unknown_required_controls(scope)
@@ -1194,17 +1459,18 @@ async def apply_to_job(
                 raise ManualReviewRequired(
                     "Known fields were filled, but no supported submit button was found"
                 )
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            submitted_forms.add(form_key)
             await submit.click()
-            await page.wait_for_timeout(250)
-            await require_safe_application_destination()
-            response = await _wait_for_application_response(
-                response_future, min(apply_timeout_ms, 5_000)
-            )
-            if response is not None:
-                return await confirmed_outcome(response)
 
+        await require_safe_application_destination()
+        response = await _wait_for_application_response(response_future, 0)
+        if response is not None:
+            return await confirmed_outcome(response)
         raise ManualReviewRequired(
-            "Application form finished without a matching Shine application response"
+            "Application timed out without a matching Shine application response"
+            + (" after submitting the supported form once" if submitted_forms else " or a supported form")
         )
     finally:
         page.remove_listener("response", observe_application_response)
@@ -1212,13 +1478,90 @@ async def apply_to_job(
         page.context.remove_listener("page", observe_application_page)
 
 
-def write_report(rows: list[dict]) -> None:
+_CONFIRMED_APPLICATION_STATUSES = {"applied", "already_applied", "already_seen"}
+
+
+def _report_status(row: dict) -> tuple[str, str]:
+    status = str(row.get("status", "unknown")).strip()
+    group, separator, detail = status.partition(":")
+    return group.strip(), detail.strip() if separator else ""
+
+
+def _report_reason(row: dict) -> str:
+    group, detail = _report_status(row)
+    if group == "shortlisted":
+        return "Dry-run preview only; no application was submitted."
+    if group == "rejected":
+        reasons = str(row.get("reasons", "")).strip()
+        return f"Did not meet the matching rules: {reasons}" if reasons else "Did not meet the matching rules."
+    if group == "pre_filtered":
+        return detail or "Skipped by preliminary title or experience rules; the full description was not checked."
+    if group == "not_evaluated":
+        return detail or "The full description was not checked in this run."
+    if group == "needs_review":
+        return detail or "The application outcome needs manual verification."
+    if group in {"run_limit", "daily_limit", "both_application_limits", "daily_or_run_limit"}:
+        return detail or "An application limit prevented this application."
+    if group == "role_family_limit":
+        return "The application limit for this role family was reached."
+    if group == "retry_cooldown":
+        reasons = str(row.get("reasons", "")).strip()
+        return detail or reasons or "An automatic retry is paused until its cooldown expires."
+    if group == "manual_review_pending":
+        reasons = str(row.get("reasons", "")).strip()
+        return detail or reasons or "This job needs manual verification or completion."
+    if detail:
+        return detail
+    return f"No confirmed application was recorded (status: {group or 'unknown'})."
+
+
+def _report_next_step(row: dict) -> str:
+    group, _ = _report_status(row)
+    if group == "shortlisted":
+        return "This was a preview. Set DRY_RUN=false only when ready to submit eligible applications."
+    if group == "rejected":
+        return "Review the job and matching reasons; change rules only if the job genuinely fits your profile."
+    if group == "pre_filtered":
+        return "If suitable, review title/experience pre-filters; this job's full description was not read."
+    if group == "not_evaluated":
+        return "Let a later run check it, or raise MAX_DETAIL_JOBS_PER_RUN; it was not fully scored."
+    if group == "needs_review":
+        return "Open the job URL and artifacts/manual-review.json; verify the status and finish manually if appropriate."
+    if group in {"run_limit", "daily_limit", "both_application_limits", "daily_or_run_limit", "role_family_limit"}:
+        return "Review MAX_APPLICATIONS_PER_RUN and MAX_APPLICATIONS_PER_DAY in .env; otherwise wait for the blocking limit to reset."
+    if group == "retry_cooldown":
+        return "Wait until retry_after in state/attempts.json, or open the job URL and handle it manually."
+    if group == "manual_review_pending":
+        return "Open the exact job on Shine, verify whether it is already applied, and complete it manually if not."
+    return "Open the job URL and inspect its status and reason before deciding whether to apply manually."
+
+
+def unapplied_report_rows(rows: list[dict]) -> list[dict]:
+    """Return only jobs without a confirmed application, with clear guidance."""
+    report_rows: list[dict] = []
+    for row in rows:
+        group, _ = _report_status(row)
+        if group in _CONFIRMED_APPLICATION_STATUSES:
+            continue
+        report_row = dict(row)
+        report_row["reason_not_applied"] = _report_reason(row)
+        report_row["recommended_action"] = _report_next_step(row)
+        report_rows.append(report_row)
+    return report_rows
+
+
+def write_report(rows: list[dict]) -> int:
+    """Replace the per-run CSV with only jobs lacking confirmed applications."""
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    fields = ["score", "accepted", "status", "title", "company", "experience", "url", "reasons"]
-    with REPORT_FILE.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
+    fields = ["score", "accepted", "status", "title", "company", "experience", "url", "reasons",
+              "reason_not_applied", "recommended_action", "detail_evaluated", "is_early_applicant"]
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=fields)
+    writer.writeheader()
+    report_rows = unapplied_report_rows(rows)
+    writer.writerows(report_rows)
+    atomic_write_text(REPORT_FILE, buffer.getvalue())
+    return len(report_rows)
 
 
 def archive_unreferenced_error_screenshots(manual_jobs: list[dict]) -> int:
@@ -1284,32 +1627,26 @@ def write_json_reports(
         for url, item in sorted(history.items())
         if history_entry_is_verified(item)
     ]
-    status_counts: dict[str, int] = {}
-    for row in rows:
-        status = str(row.get("status", "unknown"))
-        status_counts[status] = status_counts.get(status, 0) + 1
+    summary = build_run_summary(rows, search_metrics)
+    summary["applied_jobs_in_history"] = len(applied_jobs)
 
     scored_payload = {
         "generated_at": generated_at,
         "mode": "dry_run" if dry_run else "live",
-        "summary": {
-            "evaluated_in_this_run": len(rows),
-            "accepted_in_this_run": sum(bool(row.get("accepted")) for row in rows),
-            "applied_jobs_in_history": len(applied_jobs),
-            "status_counts": status_counts,
-        },
+        "status": final_run_status(summary),
+        "summary": summary,
         "how_to_read": {
             "score": "Higher means a closer resume match; 60 or more can qualify.",
             "accepted": "True means the job passed the resume rules.",
             "status": "Shows whether the job was applied, shortlisted, rejected, limited, or needs review.",
+            "detail_evaluated": "True only when this run read and scored the full description.",
+            "is_early_applicant": "The search card carried the Early Applicant badge; this affects order, not eligibility.",
         },
         "applied_jobs": applied_jobs,
         "scored_jobs": rows,
         "search_metrics": search_metrics,
     }
-    SCORED_AND_APPLIED_FILE.write_text(
-        json.dumps(scored_payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    atomic_write_json(SCORED_AND_APPLIED_FILE, scored_payload)
 
     existing_items: dict[str, dict] = {}
     if MANUAL_REVIEW_FILE.exists():
@@ -1419,9 +1756,7 @@ def write_json_reports(
         ),
         "jobs": manual_jobs,
     }
-    MANUAL_REVIEW_FILE.write_text(
-        json.dumps(manual_payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    atomic_write_json(MANUAL_REVIEW_FILE, manual_payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1470,6 +1805,14 @@ async def close_browser_resources(context: BrowserContext, browser: Browser) -> 
 
 
 async def run() -> None:
+    with single_instance_run_lock(STATE_DIR / "bot-run.lock"):
+        await _run_locked()
+
+
+async def _run_locked() -> None:
+    # Clear the previous run's CSV immediately, including when config validation
+    # or the daily-cap check exits before browser startup.
+    write_report([])
     load_dotenv(ROOT / ".env")
     email = os.getenv("SHINE_EMAIL", "")
     password = os.getenv("SHINE_PASSWORD", "")
@@ -1485,7 +1828,7 @@ async def run() -> None:
     max_pages = env_int("MAX_PAGES_PER_SEARCH", 3)
     search_delay_min_seconds = env_int("SEARCH_DELAY_MIN_SECONDS", 2)
     search_delay_max_seconds = env_int("SEARCH_DELAY_MAX_SECONDS", 5)
-    action_delay = env_int("ACTION_DELAY_SECONDS", 3)
+    action_delay = env_int("ACTION_DELAY_SECONDS", 5)
     navigation_timeout_ms = env_int("NAVIGATION_TIMEOUT_SECONDS", 30) * 1_000
     authentication_timeout_ms = env_int("AUTH_TIMEOUT_SECONDS", 15) * 1_000
     apply_timeout_ms = env_int("APPLY_TIMEOUT_SECONDS", 15) * 1_000
@@ -1496,10 +1839,23 @@ async def run() -> None:
     maximum_transient_attempts = env_int("MAX_TRANSIENT_ATTEMPTS", 2)
     answers = ApplicationAnswers.from_environment()
 
+    if max_pages < 1 or max_detail_jobs < 1:
+        raise RuntimeError("MAX_PAGES_PER_SEARCH and MAX_DETAIL_JOBS_PER_RUN must be positive")
+    if min(navigation_timeout_ms, authentication_timeout_ms, apply_timeout_ms,
+           per_job_timeout_seconds, detail_timeout_seconds) <= 0:
+        raise RuntimeError("Navigation, authentication, application, and detail timeouts must be positive")
+    if min(max_per_run, max_per_day, max_per_role_family) < 0:
+        raise RuntimeError("Application limits cannot be negative")
     if search_delay_min_seconds < 0 or search_delay_min_seconds > search_delay_max_seconds:
         raise RuntimeError(
             "SEARCH_DELAY_MIN_SECONDS must be non-negative and no greater than "
             "SEARCH_DELAY_MAX_SECONDS"
+        )
+    if action_delay < 0:
+        raise RuntimeError("ACTION_DELAY_SECONDS cannot be negative")
+    if retry_delay_hours < 1 or maximum_transient_attempts < 1:
+        raise RuntimeError(
+            "MANUAL_RETRY_DELAY_HOURS and MAX_TRANSIENT_ATTEMPTS must be positive"
         )
 
     if not dry_run and (not email or not password):
@@ -1511,15 +1867,68 @@ async def run() -> None:
     for applied_url, history_item in history.items():
         if history_entry_is_verified(history_item) and attempts.pop(applied_url, None) is not None:
             attempts_changed = True
-    if attempts_changed:
+    if attempts_changed and not dry_run:
         save_attempts(attempts)
-    remaining_today = max(0, max_per_day - applications_today(history))
-    application_budget = min(max_per_run, remaining_today)
+    applications_today_at_start = applications_today(history)
+    remaining_today = max(0, max_per_day - applications_today_at_start)
     rows: list[dict] = []
-    if not dry_run and application_budget == 0:
-        print("Daily application limit reached; no browser session started")
+    initial_limit = application_limit_status(
+        0, applications_today_at_start, max_per_run, max_per_day
+    )
+    if not dry_run and initial_limit is not None:
+        limit_status, limit_reason = initial_limit
+        ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(ARTIFACT_DIR / "run-status.json", {
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "status": "limit_reached",
+            "phase": "preflight_limits",
+            "mode": "live",
+            "discovered_jobs": 0,
+            "evaluated_jobs": 0,
+            "application_limits": {
+                "blocking_status": limit_status,
+                "blocking_reason": limit_reason,
+                "maximum_per_run": max_per_run,
+                "maximum_per_day": max_per_day,
+                "applications_today_at_start": applications_today_at_start,
+                "remaining_today": remaining_today,
+            },
+            "summary": build_run_summary([], [], discovered_count=0),
+            "error": "",
+        })
+        print(f"Application run not started: {limit_reason}; no browser session started")
         return
     role_family_counts: dict[str, int] = {}
+    search_metrics: list[dict] = []
+    discovered_count = 0
+    phase = "starting_browser"
+    progress = DetailProgress(STATE_DIR / "detail-progress.json", "dry_run" if dry_run else "live")
+
+    def save_completed_progress() -> None:
+        # Persist scheduling only after reports. A crash must not advance past
+        # jobs whose scoring/application outcome has not yet been recorded.
+        progress.mark_checked(
+            row["url"] for row in rows
+            if row["detail_evaluated"] or str(row["status"]).startswith("needs_review: job-detail")
+        )
+
+    def save_run_status(status: str, error: str = "") -> None:
+        ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+        summary = build_run_summary(rows, search_metrics, discovered_count=discovered_count)
+        atomic_write_json(ARTIFACT_DIR / "run-status.json", {
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "status": status, "phase": phase,
+            "mode": "dry_run" if dry_run else "live",
+            "discovered_jobs": discovered_count,
+            "evaluated_jobs": summary["evaluated_in_this_run"],
+            "application_limits": {
+                "maximum_per_run": max_per_run,
+                "maximum_per_day": max_per_day,
+                "applications_today_at_start": applications_today_at_start,
+                "remaining_today": remaining_today,
+            },
+            "summary": summary, "error": error,
+        })
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=headless)
@@ -1530,6 +1939,8 @@ async def run() -> None:
         run_failed = False
         try:
             if not dry_run:
+                phase = "login"
+                save_run_status("running")
                 await login(page, email, password, navigation_timeout_ms)
             if tracing_enabled:
                 await context.tracing.start(
@@ -1538,6 +1949,8 @@ async def run() -> None:
                     sources=True,
                 )
                 trace_started = True
+            phase = "discovery"
+            save_run_status("running")
             jobs, search_metrics = await discover(
                 page,
                 max_pages,
@@ -1545,10 +1958,18 @@ async def run() -> None:
                 search_delay_min_seconds,
                 search_delay_max_seconds,
             )
+            discovered_count = len(jobs)
+            trace_has_failure = any(
+                p.get("status") == "failed" for metric in search_metrics for p in metric.get("pages", [])
+            )
             run_started_at = datetime.now().astimezone()
             active_jobs: list[Job] = []
             held_jobs: list[tuple[Job, str, str]] = []
             for job in jobs:
+                history_hold = history_entry_hold_status(history.get(job.url))
+                if history_hold is not None:
+                    held_jobs.append((job, history_hold[0], history_hold[1]))
+                    continue
                 hold = attempt_hold_status(attempts.get(job.url), run_started_at)
                 if hold is None:
                     active_jobs.append(job)
@@ -1556,14 +1977,17 @@ async def run() -> None:
                     hold_status, hold_reason = hold
                     held_jobs.append((job, hold_status, hold_reason))
 
+            phase = "detail_scoring"
+            save_run_status("running")
             ranked, detail_statuses = await score_detailed_jobs(
                 page,
                 active_jobs,
                 max_detail_jobs,
                 navigation_timeout_ms,
                 detail_timeout_seconds,
+                previous_checks=progress.checked_at,
             )
-            trace_has_failure = any(
+            trace_has_failure = trace_has_failure or any(
                 status.startswith("needs_review:")
                 for status in detail_statuses.values()
             )
@@ -1572,7 +1996,12 @@ async def run() -> None:
                 detail_statuses[job.url] = hold_status
 
             applied_this_run = 0
+            phase = "applications"
+            save_run_status("running")
             for result, job in ranked:
+                require_open_browser(page)
+                fatal_session_error: Exception | None = None
+                detail_evaluated = job.url not in detail_statuses
                 status = detail_statuses.get(job.url, "rejected")
                 if result.accepted:
                     family = role_family(job)
@@ -1580,8 +2009,15 @@ async def run() -> None:
                         status = "already_seen"
                     elif dry_run:
                         status = "shortlisted"
-                    elif applied_this_run >= application_budget:
-                        status = "daily_or_run_limit"
+                    elif (
+                        limit := application_limit_status(
+                            applied_this_run,
+                            applications_today_at_start + applied_this_run,
+                            max_per_run,
+                            max_per_day,
+                        )
+                    ) is not None:
+                        status = f"{limit[0]}: {limit[1]}"
                     elif role_family_counts.get(family, 0) >= max_per_role_family:
                         status = "role_family_limit"
                     else:
@@ -1634,7 +2070,15 @@ async def run() -> None:
                             except Exception:
                                 pass
                         except Exception as exc:  # capture per-job failures in the report
-                            reason = str(exc).strip() or type(exc).__name__
+                            try:
+                                require_open_browser(page)
+                            except RuntimeError as session_error:
+                                fatal_session_error = session_error
+                            reason = (
+                                "Browser closed during the application; outcome unconfirmed. "
+                                "Verify the exact job manually before retrying."
+                                if fatal_session_error else str(exc).strip() or type(exc).__name__
+                            )
                             status = f"needs_review: {reason}"
                             ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
                             try:
@@ -1650,15 +2094,16 @@ async def run() -> None:
                 if status.startswith("needs_review:"):
                     trace_has_failure = True
                     failure_reason = status.removeprefix("needs_review:").strip()
-                    record_failed_attempt(
-                        attempts,
-                        job,
-                        failure_reason,
-                        datetime.now().astimezone(),
-                        retry_delay_hours,
-                        maximum_transient_attempts,
-                    )
-                    save_attempts(attempts)
+                    if not dry_run:
+                        record_failed_attempt(
+                            attempts,
+                            job,
+                            failure_reason,
+                            datetime.now().astimezone(),
+                            retry_delay_hours,
+                            maximum_transient_attempts,
+                        )
+                        save_attempts(attempts)
 
                 rows.append(
                     {
@@ -1670,12 +2115,29 @@ async def run() -> None:
                         "experience": f"{job.min_experience}-{job.max_experience}",
                         "url": job.url,
                         "reasons": "; ".join(result.reasons),
+                        "detail_evaluated": detail_evaluated,
+                        "is_early_applicant": job.is_early_applicant,
                     }
                 )
-            write_report(rows)
+                # Save the current non-applied queue before the next browser
+                # action can fail. Successful rows are intentionally omitted.
+                write_report(rows)
+                if status in {"applied", "already_applied"} or status.startswith("needs_review:"):
+                    write_json_reports(rows, dry_run, history, attempts, search_metrics)
+                if fatal_session_error is not None:
+                    raise fatal_session_error
+            written_rows = write_report(rows)
             write_json_reports(rows, dry_run, history, attempts, search_metrics)
-        except Exception:
+            save_completed_progress()
+            phase = "finished"
+            save_run_status(final_run_status(build_run_summary(rows, search_metrics)))
+        except Exception as exc:
             run_failed = True
+            if rows:
+                write_report(rows)
+                write_json_reports(rows, dry_run, history, attempts, search_metrics)
+                save_completed_progress()
+            save_run_status("failed", str(exc).strip() or type(exc).__name__)
             raise
         finally:
             if trace_started:
@@ -1696,7 +2158,11 @@ async def run() -> None:
                 if not run_failed:
                     raise
 
-    print(f"Wrote {len(rows)} evaluated jobs to {REPORT_FILE}")
+    summary = build_run_summary(rows, search_metrics)
+    print(f"Wrote {written_rows} not-confirmed-as-applied job rows to {REPORT_FILE}; "
+          f"{summary['evaluated_in_this_run']} fully scored, "
+          f"{summary['not_evaluated_in_this_run']} outside the detail budget; "
+          f"run status: {final_run_status(summary)}")
     print("DRY RUN: no applications were submitted" if dry_run else "Application run complete")
 
 
