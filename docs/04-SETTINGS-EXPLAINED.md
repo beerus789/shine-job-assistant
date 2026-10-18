@@ -8,8 +8,8 @@ settings can be adjusted using plain numbers or `true` / `false`.
 | `DRY_RUN` | `true` | Scores jobs without submitting applications. |
 | `HEADLESS` | `false` | The browser remains visible. |
 | `ENABLE_TRACING` | `false` | Saves a private Playwright trace only when a run fails. |
-| `MAX_APPLICATIONS_PER_RUN` | `20` | Maximum successful applications in one launch. When reached, remaining suitable jobs are marked `run_limit`. |
-| `MAX_APPLICATIONS_PER_DAY` | `20` | Hard daily limit across launches. When reached, remaining suitable jobs are marked `daily_limit`. |
+| `MAX_APPLICATIONS_PER_RUN` | `20` | Maximum Apply attempts in one launch, including unsuccessful attempts. This prevents a run from trying an unbounded number of jobs when Apply is failing; remaining suitable jobs are marked `run_limit`. |
+| `MAX_APPLICATIONS_PER_DAY` | `120` | Hard daily limit across launches. When reached, remaining suitable jobs are marked `daily_limit`. |
 | `MAX_APPLICATIONS_PER_ROLE_FAMILY` | `20` | Additional ceiling for a role family in one launch. This never raises either global cap. |
 | `MAX_PAGES_PER_SEARCH` | `3` | Checks the first three pages of each precise search. |
 | `MAX_DETAIL_JOBS_PER_RUN` | `250` | Maximum candidate pages attempted for final scoring in one run; remaining candidates get priority in later runs. |

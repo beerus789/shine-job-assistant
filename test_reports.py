@@ -243,6 +243,65 @@ def test_atomic_json_write_replaces_file_with_complete_document(tmp_path):
     assert list(tmp_path.iterdir()) == [destination]
 
 
+def test_atomic_write_retries_a_temporary_file_sharing_error(tmp_path, monkeypatch):
+    destination = tmp_path / "latest.csv"
+    destination.write_text("old", encoding="utf-8")
+    real_replace = bot.os.replace
+    calls = 0
+
+    def briefly_locked(source, target):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise PermissionError("temporary sharing violation")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(bot.os, "replace", briefly_locked)
+    bot.atomic_write_text(destination, "new")
+    assert calls == 3
+    assert destination.read_text(encoding="utf-8") == "new"
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_obsolete_detail_selector_failure_releases_only_its_own_holds():
+    obsolete_url = "https://www.shine.com/jobs/python/example/123"
+    unrelated_url = "https://www.shine.com/jobs/python/example/456"
+    attempts = {
+        obsolete_url: {
+            "status": "manual_only",
+            "failure_reason": bot.OBSOLETE_DETAIL_LAYOUT_FAILURE,
+        },
+        unrelated_url: {
+            "status": "manual_only",
+            "failure_reason": "Employer screening questions require manual review",
+        },
+    }
+    assert bot.release_obsolete_detail_holds(attempts) == {obsolete_url}
+    assert set(attempts) == {unrelated_url}
+
+
+def test_obsolete_detail_selector_failure_leaves_manual_queue(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "ARTIFACT_DIR", tmp_path)
+    monkeypatch.setattr(bot, "SCORED_AND_APPLIED_FILE", tmp_path / "scored.json")
+    monkeypatch.setattr(bot, "MANUAL_REVIEW_FILE", tmp_path / "manual-review.json")
+    manual = {
+        "jobs": [
+            {"url": "https://www.shine.com/jobs/python/example/123",
+             "failure_reason": bot.OBSOLETE_DETAIL_LAYOUT_FAILURE},
+            {"url": "https://www.shine.com/jobs/python/example/456",
+             "failure_reason": "Employer screening questions require manual review"},
+        ]
+    }
+    bot.MANUAL_REVIEW_FILE.write_text(json.dumps(manual), encoding="utf-8")
+
+    bot.write_json_reports([], False, {})
+
+    saved = json.loads(bot.MANUAL_REVIEW_FILE.read_text(encoding="utf-8"))
+    assert [job["url"] for job in saved["jobs"]] == [
+        "https://www.shine.com/jobs/python/example/456"
+    ]
+
+
 def test_read_only_audit_separates_accepted_and_not_evaluated_jobs():
     accepted_job = bot.Job(
         title="Python Backend Developer",
@@ -313,6 +372,20 @@ class FakeApplicationResponse:
         return {"job_id": self._response_job_id}
 
 
+class CurrentShineApplicationResponse(FakeApplicationResponse):
+    async def json(self):
+        return {
+            "data": {
+                "candidate_id": "candidate",
+                "is_auto_apply": 1,
+                "application_trigger_point": 2,
+                "job_id": self._response_job_id,
+            },
+            "message": "SUCCESS",
+            "statusCode": 201,
+        }
+
+
 def test_application_response_must_match_the_current_job_id():
     matching = FakeApplicationResponse("123", 123)
     wrong_request = FakeApplicationResponse("999", 999)
@@ -328,6 +401,20 @@ def test_failed_or_wrong_application_response_is_not_confirmation():
                 FakeApplicationResponse("123", 123, status=500), "123"
             )
         )
+
+
+def test_current_shine_nested_success_response_confirms_same_job():
+    response = CurrentShineApplicationResponse("123", 123)
+    status, response_job_id = asyncio.run(
+        bot._validate_job_apply_response(response, "123")
+    )
+
+    assert status == 201
+    assert response_job_id == "123"
+
+    wrong_job = CurrentShineApplicationResponse("123", 456)
+    with pytest.raises(bot.ManualReviewRequired, match="different job ID"):
+        asyncio.run(bot._validate_job_apply_response(wrong_job, "123"))
 
     with pytest.raises(bot.ManualReviewRequired, match="different job ID"):
         asyncio.run(
@@ -357,6 +444,34 @@ def test_similar_job_applied_button_cannot_confirm_the_current_job():
                 await page.set_content(
                     '<main><button class="jdCard_jdBtn__one" disabled>Applied</button>'
                     '<button class="jdCard_jdBtn__two" disabled>Applied</button></main>'
+                )
+                assert not await bot._current_job_is_applied(page)
+
+                await page.set_content(
+                    '<main><button data-apply-trigger="true">Apply Now</button></main>'
+                    '<aside><button aria-label="Apply on Hire Feed">Apply</button></aside>'
+                )
+                primary = await bot._current_job_apply_button(page, "123")
+                assert await primary.get_attribute("data-apply-trigger") == "true"
+
+                await page.set_content(
+                    '<main><button data-apply-trigger="true" disabled>Applied</button></main>'
+                    '<aside><button aria-label="Apply on Hire Feed" disabled>Applied</button></aside>'
+                )
+                assert await bot._current_job_is_applied(page)
+
+                await page.set_content(
+                    '<div class="role-overview-card_actions__x">'
+                    '<span aria-label="You already applied to this job">Applied</span>'
+                    '</div>'
+                    '<div class="role-overview-card_applyBarActions__x">'
+                    '<span aria-label="You already applied to this job">Applied</span>'
+                    '</div>'
+                )
+                assert await bot._current_job_is_applied(page)
+
+                await page.set_content(
+                    '<aside><span aria-label="You already applied to this job">Applied</span></aside>'
                 )
                 assert not await bot._current_job_is_applied(page)
             finally:
@@ -1163,4 +1278,105 @@ def test_run_records_uncertain_application_before_stopping_on_browser_close(
     assert manual["jobs"][0]["automation_status"] == "manual_only"
     assert "outcome unconfirmed" in manual["jobs"][0]["failure_reason"]
     assert status["status"] == "failed"
+
+
+def test_failed_apply_attempts_respect_the_per_run_cap(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    state_dir = tmp_path / "state"
+    artifact_dir = tmp_path / "artifacts"
+    monkeypatch.setattr(bot, "STATE_DIR", state_dir)
+    monkeypatch.setattr(bot, "HISTORY_FILE", state_dir / "history.json")
+    monkeypatch.setattr(bot, "ATTEMPTS_FILE", state_dir / "attempts.json")
+    monkeypatch.setattr(bot, "ARTIFACT_DIR", artifact_dir)
+    monkeypatch.setattr(bot, "REPORT_FILE", artifact_dir / "latest.csv")
+    monkeypatch.setattr(bot, "SCORED_AND_APPLIED_FILE", artifact_dir / "scored.json")
+    monkeypatch.setattr(bot, "MANUAL_REVIEW_FILE", artifact_dir / "manual-review.json")
+    monkeypatch.setattr(bot, "load_dotenv", lambda *args, **kwargs: None)
+    jobs = [
+        bot.Job(
+            title="Python Backend Developer",
+            company="Example",
+            url=f"https://www.shine.com/jobs/python/example/{number}",
+            text="Python FastAPI backend",
+        )
+        for number in range(3)
+    ]
+    attempts = 0
+
+    async def fake_discover(*args, **kwargs):
+        return jobs, [{"unique_jobs_added": 3, "pages": [{"status": "ready"}]}]
+
+    async def fake_score(*args, **kwargs):
+        return [(bot.ScoreResult(80, True, ("eligible",)), job) for job in jobs], {}
+
+    async def fake_apply(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise bot.ManualReviewRequired("simulated application failure")
+
+    class FakePage:
+        def __init__(self, context):
+            self.context = context
+
+        def is_closed(self):
+            return False
+
+        async def screenshot(self, **kwargs):
+            return None
+
+    class FakeContext:
+        def __init__(self, browser):
+            self.browser = browser
+
+        async def new_page(self):
+            return FakePage(self)
+
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        async def new_context(self):
+            return FakeContext(self)
+
+        def is_connected(self):
+            return True
+
+        async def close(self):
+            return None
+
+    class FakePlaywright:
+        async def __aenter__(self):
+            self.chromium = SimpleNamespace(launch=self.launch)
+            return self
+
+        async def launch(self, **kwargs):
+            return FakeBrowser()
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(bot, "async_playwright", FakePlaywright)
+    monkeypatch.setattr(bot, "login", lambda *args, **kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(bot, "discover", fake_discover)
+    monkeypatch.setattr(bot, "score_detailed_jobs", fake_score)
+    monkeypatch.setattr(bot, "apply_to_job", fake_apply)
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("HEADLESS", "true")
+    monkeypatch.setenv("ENABLE_TRACING", "false")
+    monkeypatch.setenv("SHINE_EMAIL", "test@example.com")
+    monkeypatch.setenv("SHINE_PASSWORD", "test-password")
+    monkeypatch.setenv("MAX_APPLICATIONS_PER_RUN", "1")
+    monkeypatch.setenv("MAX_APPLICATIONS_PER_DAY", "10")
+    monkeypatch.setenv("MAX_DETAIL_JOBS_PER_RUN", "3")
+
+    asyncio.run(bot.run())
+
+    assert attempts == 1
+    status = json.loads((artifact_dir / "run-status.json").read_text(encoding="utf-8"))
+    assert status["application_limits"]["attempts_this_run"] == 1
+    with (artifact_dir / "latest.csv").open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert sum(row["status"].startswith("needs_review:") for row in rows) == 1
+    assert sum(row["status"].startswith("run_limit: application attempt limit") for row in rows) == 2
     assert not (state_dir / "history.json").exists()
