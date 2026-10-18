@@ -68,6 +68,40 @@ def test_extracts_early_applicant_badge_and_preserves_it_across_duplicate_cards(
     asyncio.run(with_browser(scenario))
 
 
+@pytest.mark.parametrize("wrapped_heading", [False, True])
+def test_job_detail_reads_legacy_and_wrapped_description_sections(wrapped_heading):
+    def section(label, content):
+        heading = f"<h2>{label}</h2>"
+        if wrapped_heading:
+            heading = f'<div class="section-head">{heading}</div>'
+        return f"<section>{heading}<div>{content}</div></section>"
+
+    html = (
+        section("Job Description", "Python FastAPI backend development")
+        + section("Key Highlights", "3 to 6 Yrs")
+        + section("SKILLS", "<ul><li>Python</li><li>FastAPI</li></ul>")
+    )
+    job = bot.Job(
+        title="Python Backend Developer",
+        company="Example",
+        url="https://www.shine.com/jobs/python/example/123",
+        text="Python backend",
+    )
+
+    async def scenario(page):
+        await page.route(
+            "https://www.shine.com/jobs/**",
+            lambda route: route.fulfill(body=html, content_type="text/html"),
+        )
+        detailed = await bot.extract_job_detail(page, job, 2000)
+        assert "Python FastAPI backend development" in detailed.text
+        assert "3 to 6 Yrs" in detailed.text
+        assert detailed.skills == ("Python", "FastAPI")
+        assert (detailed.min_experience, detailed.max_experience) == (3, 6)
+
+    asyncio.run(with_browser(scenario))
+
+
 def test_unknown_experience_screening_question_is_not_whitelisted_as_known_field():
     async def scenario(page):
         await page.set_content('''<form>

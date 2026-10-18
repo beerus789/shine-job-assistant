@@ -16,6 +16,7 @@ import os
 import random
 import re
 import tempfile
+import time
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -59,6 +60,9 @@ REPORT_FILE = ARTIFACT_DIR / "latest.csv"
 SCORED_AND_APPLIED_FILE = ARTIFACT_DIR / "scored-and-applied.json"
 MANUAL_REVIEW_FILE = ARTIFACT_DIR / "manual-review.json"
 SEARCH_CARD_SELECTOR = 'article[itemprop="itemListElement"], article[class*="result-card_card__"], div.jdbigCard'
+OBSOLETE_DETAIL_LAYOUT_FAILURE = (
+    "job-detail extraction failed: Job Description content was not found"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +161,7 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 def atomic_write_text(path: Path, text: str) -> None:
-    """Write a same-directory temporary file, then atomically replace the target."""
+    """Atomically replace a file, retrying brief Windows sharing conflicts."""
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -168,7 +172,14 @@ def atomic_write_text(path: Path, text: str) -> None:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        for attempt in range(6):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
     finally:
         try:
             temporary.unlink()
@@ -272,6 +283,21 @@ def load_attempts() -> dict[str, dict]:
 
 def save_attempts(attempts: dict[str, dict]) -> None:
     atomic_write_json(ATTEMPTS_FILE, attempts)
+
+
+def release_obsolete_detail_holds(attempts: dict[str, dict]) -> set[str]:
+    """Retry pages held only because the old description selector was broken.
+
+    These failures occurred before Apply was clicked. Other manual-review and
+    retry records remain untouched.
+    """
+    released = {
+        url for url, entry in attempts.items()
+        if entry.get("failure_reason") == OBSOLETE_DETAIL_LAYOUT_FAILURE
+    }
+    for url in released:
+        del attempts[url]
+    return released
 
 
 def history_entry_is_verified(item: dict) -> bool:
@@ -634,6 +660,18 @@ def merge_job_details(
     )
 
 
+async def _adjacent_detail_content(label: Locator) -> Locator | None:
+    """Find a section body in both Shine's direct and wrapped heading layouts."""
+    for path in (
+        "xpath=following-sibling::*[1]",
+        "xpath=../following-sibling::*[1]",
+    ):
+        content = label.locator(path)
+        if await content.count() == 1 and (await content.inner_text()).strip():
+            return content
+    return None
+
+
 async def extract_job_detail(
     page: Page, job: Job, navigation_timeout_ms: int
 ) -> Job:
@@ -650,8 +688,8 @@ async def extract_job_detail(
     await description_heading.wait_for(state="visible", timeout=navigation_timeout_ms)
     if await description_heading.count() != 1:
         raise RuntimeError("Expected one Job Description heading")
-    description_scope = description_heading.locator("xpath=following-sibling::*[1]")
-    if await description_scope.count() != 1:
+    description_scope = await _adjacent_detail_content(description_heading)
+    if description_scope is None:
         raise RuntimeError("Job Description content was not found")
     description = (await description_scope.inner_text()).strip()
     if not description:
@@ -660,15 +698,15 @@ async def extract_job_detail(
     highlights = ""
     highlights_heading = page.get_by_role("heading", name="Key Highlights", exact=True)
     if await highlights_heading.count() == 1:
-        highlights_scope = highlights_heading.locator("xpath=following-sibling::*[1]")
-        if await highlights_scope.count() == 1:
+        highlights_scope = await _adjacent_detail_content(highlights_heading)
+        if highlights_scope is not None:
             highlights = (await highlights_scope.inner_text()).strip()
 
     detail_skills: list[str] = []
     skills_label = page.get_by_text("SKILLS", exact=True)
     if await skills_label.count() == 1:
-        skills_scope = skills_label.locator("xpath=following-sibling::*[1]")
-        if await skills_scope.count() == 1:
+        skills_scope = await _adjacent_detail_content(skills_label)
+        if skills_scope is not None:
             detail_skills = await skills_scope.locator("a, li").all_inner_texts()
             if not detail_skills:
                 detail_skills = (await skills_scope.inner_text()).splitlines()
@@ -1191,7 +1229,14 @@ async def _validate_job_apply_response(response: Response, job_id: str) -> tuple
         raise ManualReviewRequired(
             "Shine application API returned an unreadable confirmation"
         ) from exc
-    response_job_id = str(payload.get("job_id", "")) if isinstance(payload, dict) else ""
+    # Shine's current BFF returns {data: {job_id: ...}, message: "SUCCESS",
+    # statusCode: 201}; older responses placed job_id at the top level.
+    response_data = payload.get("data", payload) if isinstance(payload, dict) else {}
+    response_job_id = (
+        str(response_data.get("job_id", ""))
+        if isinstance(response_data, dict)
+        else ""
+    )
     if response_job_id != str(job_id):
         raise ManualReviewRequired(
             "Shine application confirmation referenced a different job ID"
@@ -1200,18 +1245,47 @@ async def _validate_job_apply_response(response: Response, job_id: str) -> tuple
 
 
 def _current_job_applied_button(page: Page) -> Locator:
-    """Locate the disabled Applied button in the primary job-detail card only."""
+    """Locate current-job Applied indicators in the detail card and sticky bar."""
 
-    return page.locator('button[class*="jdCard_jdBtn"]').filter(
-        has_text=re.compile(r"^\s*Applied\s*$", re.I)
-    )
+    return page.locator(
+        'div[class*="role-overview-card_actions"] '
+        '[aria-label="You already applied to this job"], '
+        'div[class*="role-overview-card_applyBarActions"] '
+        '[aria-label="You already applied to this job"], '
+        'button[data-apply-trigger="true"], '
+        'button[class*="jdCard_jdBtn"]'
+    ).filter(has_text=re.compile(r"^\s*Applied\s*$", re.I))
+
+
+async def _current_job_apply_button(page: Page, job_id: str) -> Locator:
+    """Select this job's main Apply control, excluding recommendation cards."""
+    for selector in (
+        'button[data-apply-trigger="true"]',
+        f'button[id="id_apply_{job_id}"]',
+    ):
+        button = page.locator(selector)
+        if await button.count() == 1 and await button.is_visible():
+            return button
+    raise RuntimeError("Current job's primary Apply button was not found")
 
 
 async def _current_job_is_applied(page: Page) -> bool:
-    button = _current_job_applied_button(page)
-    if await button.count() != 1:
+    modern_indicators = page.locator(
+        'div[class*="role-overview-card_actions"] '
+        '[aria-label="You already applied to this job"], '
+        'div[class*="role-overview-card_applyBarActions"] '
+        '[aria-label="You already applied to this job"]'
+    )
+    for index in range(await modern_indicators.count()):
+        if await modern_indicators.nth(index).is_visible():
+            return True
+
+    legacy_buttons = page.locator(
+        'button[data-apply-trigger="true"], button[class*="jdCard_jdBtn"]'
+    ).filter(has_text=re.compile(r"^\s*Applied\s*$", re.I))
+    if await legacy_buttons.count() != 1:
         return False
-    return await button.is_visible() and await button.is_disabled()
+    return await legacy_buttons.is_visible() and await legacy_buttons.is_disabled()
 
 
 async def _verify_persisted_application(
@@ -1227,17 +1301,14 @@ async def _verify_persisted_application(
         raise ManualReviewRequired(
             f"Could not recheck the applied job because it redirected to {page.url}"
         )
-    await page.get_by_text("skills matched with your profile", exact=False).wait_for(
-        state="visible", timeout=authentication_timeout_ms
-    )
     applied = _current_job_applied_button(page)
     try:
-        await applied.wait_for(state="visible", timeout=authentication_timeout_ms)
+        await applied.first.wait_for(state="visible", timeout=authentication_timeout_ms)
     except Exception as exc:
         raise ManualReviewRequired(
             "Shine accepted the application request but Applied did not persist after reload"
         ) from exc
-    if await applied.count() != 1 or not await applied.is_disabled():
+    if not await _current_job_is_applied(page):
         raise ManualReviewRequired(
             "Shine accepted the application request but the current job is not persistently Applied"
         )
@@ -1281,17 +1352,14 @@ async def apply_to_job(
     if not _same_job_path(job.url, page.url):
         raise ManualReviewRequired(f"Job navigation redirected to {page.url}")
 
-    # Shine initially renders the signed-out version of a job page and then
-    # hydrates the authenticated state. Do not click until that transition is
-    # complete; otherwise Apply can redirect back to login.
-    authenticated_profile = page.get_by_text(
-        "skills matched with your profile", exact=False
-    )
-    await authenticated_profile.wait_for(
-        state="visible", timeout=authentication_timeout_ms
-    )
-
     job_id = urlsplit(job.url).path.rstrip("/").rsplit("/", 1)[-1]
+    # The older profile-match label has disappeared from current job pages.
+    # Wait for the primary job action to hydrate, then rely on the exact-job
+    # application response and persisted Applied state for confirmation.
+    await page.locator(
+        'button[data-apply-trigger="true"], '
+        f'button[id="id_apply_{job_id}"], button[class*="jdCard_jdBtn"]'
+    ).first.wait_for(state="visible", timeout=authentication_timeout_ms)
     if await _current_job_is_applied(page):
         return ApplicationOutcome(
             status="already_applied",
@@ -1300,10 +1368,7 @@ async def apply_to_job(
             verified_at=datetime.now().astimezone().isoformat(),
         )
 
-    button = page.locator(f'button[id="id_apply_{job_id}"]')
-    count = await button.count()
-    if count != 1:
-        raise RuntimeError(f"Expected one primary Apply button; found {count}")
+    button = await _current_job_apply_button(page, job_id)
 
     response_future: asyncio.Future[Response] = asyncio.get_running_loop().create_future()
     pages_before_click = tuple(page.context.pages)
@@ -1656,6 +1721,7 @@ def write_json_reports(
                 item["url"]: item
                 for item in existing.get("jobs", [])
                 if item.get("url")
+                and item.get("failure_reason") != OBSOLETE_DETAIL_LAYOUT_FAILURE
             }
         except (json.JSONDecodeError, OSError):
             existing_items = {}
@@ -1863,7 +1929,8 @@ async def _run_locked() -> None:
 
     history = load_history()
     attempts = load_attempts()
-    attempts_changed = False
+    obsolete_detail_urls = release_obsolete_detail_holds(attempts)
+    attempts_changed = bool(obsolete_detail_urls)
     for applied_url, history_item in history.items():
         if history_entry_is_verified(history_item) and attempts.pop(applied_url, None) is not None:
             attempts_changed = True
@@ -1872,6 +1939,7 @@ async def _run_locked() -> None:
     applications_today_at_start = applications_today(history)
     remaining_today = max(0, max_per_day - applications_today_at_start)
     rows: list[dict] = []
+    attempted_this_run = 0
     initial_limit = application_limit_status(
         0, applications_today_at_start, max_per_run, max_per_day
     )
@@ -1890,6 +1958,7 @@ async def _run_locked() -> None:
                 "blocking_reason": limit_reason,
                 "maximum_per_run": max_per_run,
                 "maximum_per_day": max_per_day,
+                "attempts_this_run": 0,
                 "applications_today_at_start": applications_today_at_start,
                 "remaining_today": remaining_today,
             },
@@ -1903,6 +1972,8 @@ async def _run_locked() -> None:
     discovered_count = 0
     phase = "starting_browser"
     progress = DetailProgress(STATE_DIR / "detail-progress.json", "dry_run" if dry_run else "live")
+    for url in obsolete_detail_urls:
+        progress.checked_at.pop(url, None)
 
     def save_completed_progress() -> None:
         # Persist scheduling only after reports. A crash must not advance past
@@ -1924,6 +1995,7 @@ async def _run_locked() -> None:
             "application_limits": {
                 "maximum_per_run": max_per_run,
                 "maximum_per_day": max_per_day,
+                "attempts_this_run": attempted_this_run,
                 "applications_today_at_start": applications_today_at_start,
                 "remaining_today": remaining_today,
             },
@@ -2018,9 +2090,14 @@ async def _run_locked() -> None:
                         )
                     ) is not None:
                         status = f"{limit[0]}: {limit[1]}"
+                    elif attempted_this_run >= max_per_run:
+                        status = (
+                            f"run_limit: application attempt limit ({max_per_run}) reached"
+                        )
                     elif role_family_counts.get(family, 0) >= max_per_role_family:
                         status = "role_family_limit"
                     else:
+                        attempted_this_run += 1
                         try:
                             application_outcome = await asyncio.wait_for(
                                 apply_to_job(
@@ -2119,10 +2196,15 @@ async def _run_locked() -> None:
                         "is_early_applicant": job.is_early_applicant,
                     }
                 )
-                # Save the current non-applied queue before the next browser
-                # action can fail. Successful rows are intentionally omitted.
-                write_report(rows)
-                if status in {"applied", "already_applied"} or status.startswith("needs_review:"):
+                # Checkpoint actual application outcomes before the next Apply.
+                # Detail failures and rejected cards are saved together below;
+                # rewriting the CSV for every one caused Windows file clashes.
+                application_checkpoint = result.accepted and (
+                    status in {"applied", "already_applied"}
+                    or status.startswith("needs_review:")
+                )
+                if application_checkpoint:
+                    write_report(rows)
                     write_json_reports(rows, dry_run, history, attempts, search_metrics)
                 if fatal_session_error is not None:
                     raise fatal_session_error

@@ -17,6 +17,7 @@ import config
 from bot import (
     BASE_URL,
     ROOT,
+    _current_job_apply_button,
     extract_job_detail,
     extract_jobs,
     slugify,
@@ -67,9 +68,7 @@ async def _run_smoke_test_locked() -> None:
                 raise RuntimeError("Job-description extraction returned too little text")
 
             job_id = candidate.url.rstrip("/").rsplit("/", 1)[-1]
-            apply_button = page.locator(f'button[id="id_apply_{job_id}"]')
-            if await apply_button.count() != 1:
-                raise RuntimeError("Primary Apply selector no longer finds exactly one button")
+            await _current_job_apply_button(page, job_id)
 
             await page.goto(
                 f"{BASE_URL}/pages/myshine/login",
