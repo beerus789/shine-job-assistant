@@ -10,7 +10,8 @@ Use this as the main record. It contains:
 - `status`: whether work completed, remains unchecked, or had a failure.
 - `summary`: separate counts for discovered jobs, report rows, and full-detail
   scoring.
-- `applied_jobs`: every successful application stored in history.
+- `applied_jobs`: confirmed applications from this run only.
+- `rejected_jobs`: jobs rejected by the full scoring rules in this run.
 - `scored_jobs`: one row for each discovered job, including jobs not fully
   scored.
 - `search_metrics`: pages, cards, and newly discovered URLs contributed by each
@@ -27,6 +28,13 @@ Each scored job shows:
   description.
 - `is_early_applicant`: whether the search card carried Shine's badge. The
   badge changes priority, not eligibility or score.
+
+This file is replaced at the start of every run and refreshed as jobs are
+processed, so it is not a month-to-month application archive. The `applied_jobs`
+and `rejected_jobs` arrays are scoped to the run shown by `generated_at` and
+`status`. Lifetime duplicate-prevention records stay in `state/history.json`;
+do not delete that file to clear a report. A `running` status means the current
+snapshot is still being updated.
 
 The summary's `evaluated_in_this_run` counts full-description checks.
 `discovered_in_this_run` counts distinct jobs found and `reported_in_this_run`
@@ -101,8 +109,10 @@ Typical failure reasons include a 45-second timeout, a redirect, an unfamiliar
 employer question, a missing `.env` answer, or a dropdown option that could not
 be matched truthfully.
 
-Failures are preserved across runs. When a job URL later appears in successful
-application history, it is removed from the unresolved manual-review queue.
+Unresolved failures are preserved across runs in this queue. When a job URL
+later appears in confirmed application history, it is removed from the manual-
+review queue. This is intentionally different from `scored-and-applied.json`,
+which is a fresh per-run snapshot.
 
 ## Important distinction
 

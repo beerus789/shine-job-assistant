@@ -40,9 +40,9 @@ the option's position, because Shine can reorder the list.
 
 - `artifacts/latest.csv`: only jobs without a confirmed application from the
   latest run, with a reason and recommended next step. It is reset at run start.
-- `artifacts/scored-and-applied.json`: scored jobs and complete application history.
+- `artifacts/scored-and-applied.json`: the latest run's scored, applied, and rejected jobs.
 - `artifacts/manual-review.json`: unresolved failures that can be handled manually.
-- `state/history.json`: jobs already applied to, used to prevent duplicates.
+- `state/history.json`: lifetime application confirmations used to prevent duplicates.
 - `state/attempts.json`: failed-attempt counts, cooldowns, and manual-only jobs.
 - `state/detail-progress.json`: recent detail-check times, kept separately for
   live runs, dry runs, and discovery audits.

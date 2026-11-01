@@ -43,6 +43,14 @@ def test_exhausted_daily_limit_is_reported_without_starting_browser(tmp_path, mo
     monkeypatch.setattr(bot, "HISTORY_FILE", state_dir / "history.json")
     monkeypatch.setattr(bot, "ARTIFACT_DIR", artifact_dir)
     monkeypatch.setattr(bot, "REPORT_FILE", artifact_dir / "latest.csv")
+    monkeypatch.setattr(
+        bot,
+        "SCORED_AND_APPLIED_FILE",
+        artifact_dir / "scored-and-applied.json",
+    )
+    monkeypatch.setattr(
+        bot, "MANUAL_REVIEW_FILE", artifact_dir / "manual-review.json"
+    )
     monkeypatch.setattr(bot, "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setattr(bot, "load_history", lambda: {
         "https://www.shine.com/jobs/python/example/1": {
@@ -66,6 +74,10 @@ def test_exhausted_daily_limit_is_reported_without_starting_browser(tmp_path, mo
     assert status["application_limits"]["blocking_status"] == "daily_limit"
     assert status["application_limits"]["applications_today_at_start"] == 1
     assert (artifact_dir / "latest.csv").is_file()
+    scored = json.loads((artifact_dir / "scored-and-applied.json").read_text(encoding="utf-8"))
+    assert scored["status"] == "limit_reached"
+    assert scored["scored_jobs"] == []
+    assert scored["applied_jobs"] == []
 
 
 def test_legacy_applied_history_is_held_for_manual_verification():
@@ -1165,20 +1177,94 @@ def test_json_reports_separate_scored_and_manual_jobs(tmp_path, monkeypatch):
     assert scored["summary"]["discovered_in_this_run"] == 12
     assert scored["summary"]["early_applicant_evaluated_in_this_run"] == 1
     assert scored["status"] == "partial_failure"
-    assert scored["summary"]["applied_jobs_in_history"] == 2
+    assert scored["summary"]["applied_jobs_in_this_run"] == 0
+    assert scored["applied_jobs"] == []
     assert len(scored["scored_jobs"]) == 2
-    applied_confirmation = next(
-        item["confirmation"]
-        for item in scored["applied_jobs"]
-        if item["status"] == "applied"
-    )
-    assert applied_confirmation["response_status"] == 201
+    assert scored["rejected_jobs"] == []
     assert scored["search_metrics"] == search_metrics
     assert manual["unresolved_count"] == 2
     assert {item["failure_reason"] for item in manual["jobs"]} == {
         "screening questions",
         "Legacy success record has no job-specific confirmation evidence",
     }
+
+
+def test_scored_json_is_replaced_each_run_and_applied_jobs_are_run_scoped(
+    tmp_path, monkeypatch
+):
+    artifact_dir = tmp_path / "artifacts"
+    scored_path = artifact_dir / "scored-and-applied.json"
+    monkeypatch.setattr(bot, "ARTIFACT_DIR", artifact_dir)
+    monkeypatch.setattr(bot, "SCORED_AND_APPLIED_FILE", scored_path)
+    monkeypatch.setattr(bot, "MANUAL_REVIEW_FILE", artifact_dir / "manual-review.json")
+
+    last_month_url = "https://example.test/jobs/last-month"
+    current_url = "https://example.test/jobs/current"
+    old_history = {
+        last_month_url: {
+            "title": "Old Backend Engineer",
+            "company": "Old Co",
+            "status": "applied",
+            "applied_at": "2026-09-15T10:00:00+05:30",
+            "score": 91,
+            "confirmation": {
+                "method": "persisted_current_job_button",
+                "job_id": "old",
+                "verified_at": "2026-09-15T10:00:01+05:30",
+            },
+        }
+    }
+    current_history = {
+        **old_history,
+        current_url: {
+            "title": "Python Backend Engineer",
+            "company": "Current Co",
+            "status": "applied",
+            "applied_at": "2026-10-18T10:00:00+05:30",
+            "score": 88,
+            "confirmation": {
+                "method": "shine_api_and_persisted_current_job_button",
+                "job_id": "new",
+                "verified_at": "2026-10-18T10:00:01+05:30",
+            },
+        },
+    }
+    applied_row = {
+        "score": 88,
+        "accepted": True,
+        "status": "applied",
+        "title": "Python Backend Engineer",
+        "company": "Current Co",
+        "url": current_url,
+        "reasons": "strong match",
+    }
+    rejected_row = {
+        "score": 20,
+        "accepted": False,
+        "status": "rejected",
+        "title": "Unrelated Role",
+        "company": "Other Co",
+        "url": "https://example.test/jobs/rejected",
+        "reasons": "required Python skill missing",
+    }
+    scored_path.parent.mkdir(parents=True)
+    scored_path.write_text('{"stale": true}', encoding="utf-8")
+
+    bot.write_json_reports([applied_row, rejected_row], False, current_history)
+    first_run = json.loads(scored_path.read_text(encoding="utf-8"))
+    assert first_run["summary"]["applied_jobs_in_this_run"] == 1
+    assert [item["url"] for item in first_run["applied_jobs"]] == [current_url]
+    assert [item["url"] for item in first_run["rejected_jobs"]] == [rejected_row["url"]]
+
+    next_rejected = {**rejected_row, "url": "https://example.test/jobs/next-run"}
+    bot.write_json_reports([next_rejected], False, current_history)
+    next_run = json.loads(scored_path.read_text(encoding="utf-8"))
+    assert "stale" not in next_run
+    assert next_run["applied_jobs"] == []
+    assert next_run["scored_jobs"] == [next_rejected]
+    assert next_run["rejected_jobs"] == [next_rejected]
+    assert next_run["summary"]["applied_jobs_in_this_run"] == 0
+    assert next_run["summary"]["rejected_jobs_in_this_run"] == 1
 
 
 def test_run_records_uncertain_application_before_stopping_on_browser_close(
