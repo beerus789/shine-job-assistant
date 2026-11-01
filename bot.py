@@ -1673,32 +1673,44 @@ def write_json_reports(
     history: dict[str, dict],
     attempts: dict[str, dict] | None = None,
     search_metrics: list[dict] | None = None,
+    run_status: str | None = None,
 ) -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     generated_at = datetime.now().astimezone().isoformat()
     attempts = attempts or {}
     search_metrics = search_metrics or []
 
-    applied_jobs = [
-        {
-            "title": item.get("title", ""),
-            "company": item.get("company", ""),
-            "url": url,
-            "score": item.get("score"),
-            "status": item.get("status", "applied"),
-            "applied_at": item.get("applied_at", ""),
-            "confirmation": item.get("confirmation"),
-        }
-        for url, item in sorted(history.items())
-        if history_entry_is_verified(item)
-    ]
+    # This artifact is a snapshot of this run, not a copy of lifetime history.
+    # Keep history.json as the durable duplicate-prevention record, and only
+    # include applications represented by rows from the current run here.
+    applied_jobs = []
+    for row in rows:
+        if row.get("status") not in {"applied", "already_applied"}:
+            continue
+        url = str(row.get("url", ""))
+        item = history.get(url, {})
+        if not url or not history_entry_is_verified(item):
+            continue
+        applied_jobs.append(
+            {
+                "title": item.get("title") or row.get("title", ""),
+                "company": item.get("company") or row.get("company", ""),
+                "url": url,
+                "score": item.get("score", row.get("score")),
+                "status": item.get("status", row.get("status", "applied")),
+                "applied_at": item.get("applied_at", ""),
+                "confirmation": item.get("confirmation"),
+            }
+        )
+    rejected_jobs = [row for row in rows if row.get("status") == "rejected"]
     summary = build_run_summary(rows, search_metrics)
-    summary["applied_jobs_in_history"] = len(applied_jobs)
+    summary["applied_jobs_in_this_run"] = len(applied_jobs)
+    summary["rejected_jobs_in_this_run"] = len(rejected_jobs)
 
     scored_payload = {
         "generated_at": generated_at,
         "mode": "dry_run" if dry_run else "live",
-        "status": final_run_status(summary),
+        "status": run_status or final_run_status(summary),
         "summary": summary,
         "how_to_read": {
             "score": "Higher means a closer resume match; 60 or more can qualify.",
@@ -1708,6 +1720,7 @@ def write_json_reports(
             "is_early_applicant": "The search card carried the Early Applicant badge; this affects order, not eligibility.",
         },
         "applied_jobs": applied_jobs,
+        "rejected_jobs": rejected_jobs,
         "scored_jobs": rows,
         "search_metrics": search_metrics,
     }
@@ -1876,13 +1889,20 @@ async def run() -> None:
 
 
 async def _run_locked() -> None:
-    # Clear the previous run's CSV immediately, including when config validation
-    # or the daily-cap check exits before browser startup.
-    write_report([])
     load_dotenv(ROOT / ".env")
+    dry_run = env_bool("DRY_RUN", True)
+    # Replace the previous run's summaries immediately. Lifetime application
+    # history remains in state/history.json for duplicate protection.
+    write_report([])
+    write_json_reports(
+        [],
+        dry_run,
+        load_history(),
+        load_attempts(),
+        run_status="starting",
+    )
     email = os.getenv("SHINE_EMAIL", "")
     password = os.getenv("SHINE_PASSWORD", "")
-    dry_run = env_bool("DRY_RUN", True)
     headless = env_bool("HEADLESS", False)
     tracing_enabled = env_bool("ENABLE_TRACING", False)
     max_per_run = env_int("MAX_APPLICATIONS_PER_RUN", 20)
@@ -1943,6 +1963,7 @@ async def _run_locked() -> None:
     initial_limit = application_limit_status(
         0, applications_today_at_start, max_per_run, max_per_day
     )
+    search_metrics: list[dict] = []
     if not dry_run and initial_limit is not None:
         limit_status, limit_reason = initial_limit
         ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1965,10 +1986,17 @@ async def _run_locked() -> None:
             "summary": build_run_summary([], [], discovered_count=0),
             "error": "",
         })
+        write_json_reports(
+            rows,
+            dry_run,
+            history,
+            attempts,
+            search_metrics,
+            run_status="limit_reached",
+        )
         print(f"Application run not started: {limit_reason}; no browser session started")
         return
     role_family_counts: dict[str, int] = {}
-    search_metrics: list[dict] = []
     discovered_count = 0
     phase = "starting_browser"
     progress = DetailProgress(STATE_DIR / "detail-progress.json", "dry_run" if dry_run else "live")
@@ -2196,16 +2224,24 @@ async def _run_locked() -> None:
                         "is_early_applicant": job.is_early_applicant,
                     }
                 )
-                # Checkpoint actual application outcomes before the next Apply.
-                # Detail failures and rejected cards are saved together below;
-                # rewriting the CSV for every one caused Windows file clashes.
+                # Keep the JSON report current after each completed job so a
+                # later timeout or browser close cannot hide earlier decisions.
+                # The CSV is checkpointed only around application outcomes to
+                # avoid repeated Windows file replacement conflicts.
                 application_checkpoint = result.accepted and (
                     status in {"applied", "already_applied"}
                     or status.startswith("needs_review:")
                 )
+                write_json_reports(
+                    rows,
+                    dry_run,
+                    history,
+                    attempts,
+                    search_metrics,
+                    run_status="running",
+                )
                 if application_checkpoint:
                     write_report(rows)
-                    write_json_reports(rows, dry_run, history, attempts, search_metrics)
                 if fatal_session_error is not None:
                     raise fatal_session_error
             written_rows = write_report(rows)
@@ -2215,10 +2251,16 @@ async def _run_locked() -> None:
             save_run_status(final_run_status(build_run_summary(rows, search_metrics)))
         except Exception as exc:
             run_failed = True
-            if rows:
-                write_report(rows)
-                write_json_reports(rows, dry_run, history, attempts, search_metrics)
-                save_completed_progress()
+            write_report(rows)
+            write_json_reports(
+                rows,
+                dry_run,
+                history,
+                attempts,
+                search_metrics,
+                run_status="failed",
+            )
+            save_completed_progress()
             save_run_status("failed", str(exc).strip() or type(exc).__name__)
             raise
         finally:
